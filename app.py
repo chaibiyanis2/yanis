@@ -5,36 +5,27 @@ import os
 
 app = Flask(__name__)
 
-# Vérification que le serveur est vivant
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health():
     return "ok", 200
 
-
-# Endpoint de montage vidéo
-@app.route("/render", methods=["POST"])
+@app.post("/render")
 def render():
-
-    # Vérifier que les fichiers sont envoyés
     if "video" not in request.files or "audio" not in request.files:
-        return {"error": "You must send 'video' and 'audio' files"}, 400
+        return {"error": "Missing 'video' or 'audio' file fields"}, 400
 
     video = request.files["video"]
     audio = request.files["audio"]
 
-    # Générer des noms uniques
     video_path = f"/tmp/{uuid.uuid4()}.mp4"
     audio_path = f"/tmp/{uuid.uuid4()}.mp3"
     output_path = f"/tmp/{uuid.uuid4()}.mp4"
 
-    # Sauvegarder les fichiers
     video.save(video_path)
     audio.save(audio_path)
 
-    # Commande FFmpeg
-    command = [
-        "ffmpeg",
-        "-y",
+    cmd = [
+        "ffmpeg", "-y",
         "-i", video_path,
         "-i", audio_path,
         "-map", "0:v:0",
@@ -46,16 +37,16 @@ def render():
         output_path
     ]
 
-    # Exécuter FFmpeg
-    subprocess.run(command)
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    # Vérifier que la vidéo existe
-    if not os.path.exists(output_path):
-        return {"error": "Video rendering failed"}, 500
+    if p.returncode != 0 or not os.path.exists(output_path):
+        return {
+            "error": "ffmpeg failed",
+            "returncode": p.returncode,
+            "stderr": p.stderr[-2000:]  # juste la fin des logs
+        }, 500
 
-    # Envoyer la vidéo finale
     return send_file(output_path, mimetype="video/mp4")
 
-
-# Lancer Flask
-app.run(host="0.0.0.0", port=10000)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
