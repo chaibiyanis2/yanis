@@ -5,9 +5,23 @@ import os
 
 app = Flask(__name__)
 
+# ✅ Page d'accueil (évite les 404 sur "/")
+@app.get("/")
+def home():
+    return {
+        "service": "ffmpeg-render-api",
+        "status": "online",
+        "endpoints": {
+            "health": "/health",
+            "render": "/render (POST multipart/form-data: video, audio)"
+        }
+    }, 200
+
+
 @app.get("/health")
 def health():
     return "ok", 200
+
 
 @app.post("/render")
 def render():
@@ -43,10 +57,11 @@ def render():
         return {
             "error": "ffmpeg failed",
             "returncode": p.returncode,
-            "stderr": p.stderr[-2000:]  # juste la fin des logs
+            "stderr": p.stderr[-2000:]
         }, 500
 
     return send_file(output_path, mimetype="video/mp4")
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
