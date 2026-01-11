@@ -23,6 +23,9 @@ EMOJI_SIZE = 44         # emoji PNG size (px)
 # Emoji display behavior
 EMOJI_MAX_DUR = 0.5     # seconds: cap emoji display duration (<= caption duration)
 
+# NEW: if audio is longer than video, slow video to exactly 16s
+TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER = 16.0
+
 # Whisper low-RAM (Render Free friendly)
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
@@ -34,7 +37,7 @@ MODEL = WhisperModel(
 
 # =========================
 # EMOJI RULES (FR, accent-insensitive) -> PNG filenames
-# Each rule = one "type" because it maps to one emoji file
+# One type = one emoji file
 # =========================
 EMOJI_RULES = [
     (["argent", "riche", "richesse", "million", "euros", "euro", "cash", "fortune"], "money.png"),
@@ -91,6 +94,9 @@ def home():
             "max_dur_s": EMOJI_MAX_DUR,
             "position": "center_exact",
             "policy": "one_per_type_per_video"
+        },
+        "video_speed": {
+            "if_audio_longer_than_video": f"slow_to_{TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER:.0f}s_then_trim_audio"
         }
     }, 200
 
@@ -137,26 +143,21 @@ def pick_emoji_for_text(text: str):
 def make_emoji_events_from_captions(captions):
     """
     ✅ Emoji appears when the keyword appears in the caption text.
-    ✅ NEW RULE: Only ONE occurrence per emoji type for the whole video.
-       Example: if "million" triggered money.png once, later "euro" won't trigger money.png again.
-       But if later "reflechir" appears, brain.png can trigger (different type).
+    ✅ Only ONE occurrence per emoji type for the whole video.
     ✅ Output: [(s, e, emoji_file, caption_text)]
     """
     events = []
-    used_types = set()  # ✅ remembers which emoji types already appeared in this video
+    used_types = set()
 
     for (s, e, text) in captions:
         emoji = pick_emoji_for_text(text)
         if not emoji:
             continue
 
-        # ✅ only one per type per video
         if emoji in used_types:
             continue
 
-        # cap emoji duration
         e2 = min(e, s + EMOJI_MAX_DUR)
-
         events.append((s, e2, emoji, text))
         used_types.add(emoji)
 
@@ -256,11 +257,19 @@ def render():
     request.files["video"].save(vpath)
     request.files["audio"].save(apath)
 
-    # duration = audio duration
+    # durations
     try:
-        duration = get_duration_seconds(apath)
+        audio_duration = get_duration_seconds(apath)
+        video_duration = get_duration_seconds(vpath)
     except Exception as e:
-        return {"error": "Cannot read audio duration", "details": str(e)}, 500
+        return {"error": "Cannot read media duration", "details": str(e)}, 500
+
+    # ✅ NEW BEHAVIOR:
+    # If audio longer than video -> slow video so output video is exactly 16s,
+    # then trim audio to match this 16s.
+    # Otherwise keep old behavior: output duration follows audio duration.
+    slow_to_16 = (audio_duration > video_duration and video_duration > 0.05)
+    target_out_duration = TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER if slow_to_16 else audio_duration
 
     # Whisper with word timestamps
     try:
@@ -284,7 +293,6 @@ def render():
         captions = build_captions_from_words(all_words)
         write_srt(captions, srt_path)
 
-        # ✅ emoji timing based on caption text + ✅ one per type per video
         emoji_events = make_emoji_events_from_captions(captions)
 
     except Exception as e:
@@ -303,7 +311,16 @@ def render():
     force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
     filter_steps = []
-    filter_steps.append(f"[0:v]subtitles={srt_path}:force_style='{force_style}'[v0]")
+
+    # ✅ IMPORTANT: if we slow the video, do it BEFORE subtitles/emoji overlays
+    # so subtitle/emoji times remain aligned to audio timeline.
+    if slow_to_16:
+        speed_factor = TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER / video_duration
+        # speed_factor > 1.0 => slow motion
+        filter_steps.append(f"[0:v]setpts=PTS*{speed_factor:.8f}[vpre]")
+        filter_steps.append(f"[vpre]subtitles={srt_path}:force_style='{force_style}'[v0]")
+    else:
+        filter_steps.append(f"[0:v]subtitles={srt_path}:force_style='{force_style}'[v0]")
 
     current = "v0"
 
@@ -316,22 +333,23 @@ def render():
         next_v = f"v{idx_ev+1}"
 
         filter_steps.append(f"[{inp_index}:v]scale={EMOJI_SIZE}:-1[em{idx_ev}]")
-
         filter_steps.append(
             f"[{current}][em{idx_ev}]overlay="
             f"x={x_center}:y={y_center}:"
             f"enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
         )
-
         current = next_v
+
+    # ✅ Audio trimming to match target duration (16s when slowed, otherwise audio duration)
+    filter_steps.append(f"[1:a]atrim=0:{target_out_duration:.3f},asetpts=PTS-STARTPTS[a0]")
 
     filter_complex = ";".join(filter_steps)
 
     ffmpeg_cmd += [
-        "-t", str(duration),
+        "-t", f"{target_out_duration:.3f}",
         "-filter_complex", filter_complex,
         "-map", f"[{current}]",
-        "-map", "1:a:0",
+        "-map", "[a0]",
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "32",
