@@ -4,6 +4,7 @@ import uuid
 import os
 import re
 import unicodedata
+import json
 from faster_whisper import WhisperModel
 
 app = Flask(__name__)
@@ -21,15 +22,12 @@ MARGIN_V = 90
 EMOJI_SIZE = 44
 EMOJI_MAX_DUR = 0.5
 
-# ✅ Audio mix volumes
 VIDEO_VOL = 1.0
 ADDED_AUDIO_VOL = 1.0
 
 # ✅ MICRO progressive zoom (whole video)
 ZOOM_START = 1.00
-ZOOM_END = 1.03  # or 1.025
-
-# ✅ Zoompan FPS (stable)
+ZOOM_END = 1.03   # or 1.025
 ZOOM_FPS = 30
 
 MODEL = WhisperModel(
@@ -93,21 +91,54 @@ def get_duration_seconds(path: str) -> float:
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
     if p.returncode != 0 or not p.stdout.strip():
-        raise RuntimeError(p.stderr.strip() or "ffprobe failed")
+        raise RuntimeError(p.stderr.strip() or "ffprobe duration failed")
     return float(p.stdout.strip())
 
 def get_video_size(path: str):
-    # returns (width, height)
-    p = subprocess.run(
+    """
+    Robust: try CSV then JSON.
+    Returns (width, height) as ints.
+    """
+    # 1) CSV attempt
+    p1 = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height",
-         "-of", "csv=s=x:p=0", path],
+         "-of", "csv=p=0:s=x", path],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    if p.returncode != 0 or not p.stdout.strip() or "x" not in p.stdout.strip():
-        raise RuntimeError(p.stderr.strip() or "ffprobe video size failed")
-    w_str, h_str = p.stdout.strip().split("x")
-    return int(w_str), int(h_str)
+    out1 = (p1.stdout or "").strip()
+    if p1.returncode == 0 and out1 and "x" in out1:
+        w_str, h_str = out1.split("x", 1)
+        w, h = int(w_str), int(h_str)
+        if w > 0 and h > 0:
+            return w, h
+
+    # 2) JSON attempt
+    p2 = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "json", path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    out2 = (p2.stdout or "").strip()
+    if p2.returncode == 0 and out2:
+        try:
+            data = json.loads(out2)
+            streams = data.get("streams") or []
+            if streams:
+                w = int(streams[0].get("width") or 0)
+                h = int(streams[0].get("height") or 0)
+                if w > 0 and h > 0:
+                    return w, h
+        except Exception:
+            pass
+
+    # 3) fail with useful info
+    raise RuntimeError(
+        "ffprobe video size failed. "
+        f"csv_stdout='{out1}' csv_stderr='{(p1.stderr or '').strip()}' "
+        f"json_stderr='{(p2.stderr or '').strip()}'"
+    )
 
 def video_has_audio(path: str) -> bool:
     p = subprocess.run(
@@ -116,7 +147,7 @@ def video_has_audio(path: str) -> bool:
          "-of", "csv=p=0", path],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    return p.returncode == 0 and bool(p.stdout.strip())
+    return p.returncode == 0 and bool((p.stdout or "").strip())
 
 def srt_ts(sec: float) -> str:
     ms = int(sec * 1000)
@@ -139,7 +170,7 @@ def pick_emoji_for_text(text: str):
     return None
 
 def make_emoji_events_from_captions(captions):
-    # ✅ only one per emoji type for the whole video
+    # ✅ only one per emoji type for whole video
     events = []
     used_types = set()
     for (s, e, text) in captions:
@@ -236,7 +267,7 @@ def render():
     request.files["video"].save(vpath)
     request.files["audio"].save(apath)
 
-    # ✅ output ends when mp3 ends
+    # ✅ output ends when mp3 ends + need video size for zoompan
     try:
         adur = get_duration_seconds(apath)
         out_dur = adur
@@ -244,7 +275,7 @@ def render():
     except Exception as e:
         return {"error": "Cannot read media info", "details": str(e)}, 500
 
-    # Transcribe added audio (as before)
+    # Transcribe added audio
     try:
         segments, _ = MODEL.transcribe(apath, vad_filter=True, word_timestamps=True)
 
@@ -278,27 +309,22 @@ def render():
 
     force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
-    # ✅ stable progressive zoom with zoompan (no crop math that crashes)
+    # zoompan (stable)
     total_frames = max(2, int(out_dur * ZOOM_FPS))
     z_delta = (ZOOM_END - ZOOM_START)
 
-    # zoom increases from start to end over total_frames
     zoom_expr = f"{ZOOM_START}+({z_delta})*on/{total_frames}"
-    # keep centered
     x_expr = "iw/2-(iw/zoom/2)"
     y_expr = "ih/2-(ih/zoom/2)"
 
     filter_steps = []
 
-    # zoom -> subtitles
     filter_steps.append(
         f"[0:v]fps={ZOOM_FPS},"
         f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d=1:s={vw}x{vh},"
         f"setpts=PTS-STARTPTS,"
-        f"subtitles={srt_path}:force_style='{force_style}'"
-        f"[v0]"
+        f"subtitles={srt_path}:force_style='{force_style}'[v0]"
     )
-
     current = "v0"
 
     # emojis centered
@@ -330,7 +356,7 @@ def render():
     filter_complex = ";".join(filter_steps)
 
     ffmpeg_cmd += [
-        "-t", str(out_dur),                 # ✅ end when mp3 ends
+        "-t", str(out_dur),
         "-filter_complex", filter_complex,
         "-map", f"[{current}]",
         "-map", audio_map,
@@ -346,7 +372,7 @@ def render():
 
     p = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
-        return {"error": "ffmpeg failed", "stderr": p.stderr[-4000:]}, 500
+        return {"error": "ffmpeg failed", "stderr": (p.stderr or "")[-4000:]}, 500
 
     return send_file(out, mimetype="video/mp4")
 
