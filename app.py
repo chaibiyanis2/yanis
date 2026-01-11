@@ -19,13 +19,16 @@ FONT_SIZE = 14
 MARGIN_V = 90
 
 EMOJI_SIZE = 44         # emoji PNG size (px)
-
-# Emoji display behavior
 EMOJI_MAX_DUR = 0.5     # seconds: cap emoji display duration (<= caption duration)
 
 # ✅ Audio mix volumes (video sound + added audio)
 VIDEO_VOL = 1.0
 ADDED_AUDIO_VOL = 1.0
+
+# ✅ MICRO progressive zoom (whole video)
+# 1.00 -> 1.03 (change to 1.025 if you prefer)
+ZOOM_START = 1.00
+ZOOM_END = 1.03
 
 # Whisper low-RAM
 MODEL = WhisperModel(
@@ -85,7 +88,8 @@ def home():
         "endpoints": {"health": "/health", "render": "/render"},
         "subtitle": {"cap_dur_ms": int(CAP_DUR * 1000), "max_cpl": MAX_CPL},
         "emoji": {"size": EMOJI_SIZE, "max_dur_s": EMOJI_MAX_DUR, "position": "center_exact"},
-        "audio": {"mode": "mix(video_audio + added_audio)", "video_vol": VIDEO_VOL, "added_vol": ADDED_AUDIO_VOL}
+        "audio": {"mode": "mix(video_audio + added_audio)", "video_vol": VIDEO_VOL, "added_vol": ADDED_AUDIO_VOL},
+        "zoom": {"start": ZOOM_START, "end": ZOOM_END}
     }, 200
 
 @app.get("/health")
@@ -239,7 +243,7 @@ def render():
     request.files["video"].save(vpath)
     request.files["audio"].save(apath)
 
-    # ✅ Use LONGEST duration so we don't cut off the video audio
+    # ✅ Video ends when MP3 ends
     try:
         vdur = get_duration_seconds(vpath)
         adur = get_duration_seconds(apath)
@@ -247,7 +251,7 @@ def render():
     except Exception as e:
         return {"error": "Cannot read media duration", "details": str(e)}, 500
 
-    # Whisper with word timestamps (we keep your logic)
+    # Whisper with word timestamps (based on added audio)
     try:
         segments, _ = MODEL.transcribe(
             apath,
@@ -288,11 +292,23 @@ def render():
 
     filter_steps = []
 
-    # Video + subtitles
-    filter_steps.append(f"[0:v]subtitles={srt_path}:force_style='{force_style}'[v0]")
+    # ✅ MICRO progressive zoom over whole output duration, then subtitles on top
+    # zoom(t) = start + (end-start) * t/out_dur
+    z_delta = (ZOOM_END - ZOOM_START)
+    dur_s = max(0.001, float(out_dur))
+    zoom_expr = f"({ZOOM_START}+({z_delta})*t/{dur_s:.6f})"
+
+    filter_steps.append(
+        f"[0:v]"
+        f"scale=iw*{zoom_expr}:ih*{zoom_expr},"
+        f"crop=iw:ih,"
+        f"subtitles={srt_path}:force_style='{force_style}'"
+        f"[v0]"
+    )
+
     current = "v0"
 
-    # Emoji overlays at exact center
+    # Emoji overlays at exact center (independent from subtitles)
     x_center = "(W-w)/2"
     y_center = "(H-h)/2"
 
@@ -308,25 +324,21 @@ def render():
         )
         current = next_v
 
-    # ✅ AUDIO MIX (REAL): keep video audio + add uploaded audio
+    # Audio mix: keep video audio + added audio
     has_vid_audio = video_has_audio(vpath)
     if has_vid_audio:
-        # Ensure both start at t=0, resample, and keep lengths
         filter_steps.append(f"[0:a]volume={VIDEO_VOL},aresample=async=1:first_pts=0[a0]")
         filter_steps.append(f"[1:a]volume={ADDED_AUDIO_VOL},aresample=async=1:first_pts=0[a1]")
-
-        # Mix both (no replacement). normalize=0 keeps true sum, so you hear both.
         filter_steps.append("[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]")
         audio_map = "[aout]"
     else:
-        # If video has no audio, just use added audio
         filter_steps.append(f"[1:a]volume={ADDED_AUDIO_VOL},aresample=async=1:first_pts=0[aout]")
         audio_map = "[aout]"
 
     filter_complex = ";".join(filter_steps)
 
     ffmpeg_cmd += [
-        "-t", str(out_dur),               # ✅ do not cut video audio anymore
+        "-t", str(out_dur),               # ✅ cut output to MP3 duration
         "-filter_complex", filter_complex,
         "-map", f"[{current}]",
         "-map", audio_map,
@@ -348,4 +360,3 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
