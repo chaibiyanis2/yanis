@@ -8,10 +8,12 @@ from faster_whisper import WhisperModel
 
 app = Flask(__name__)
 
+# ===== CONFIG =====
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
 MAX_CPL = 14
-MAX_DURATION = 2.0
+MAX_DURATION = 0.5  # ✅ 500ms par sous-titre
 
+# Whisper low-RAM (Render Free friendly)
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
     device="cpu",
@@ -20,40 +22,25 @@ MODEL = WhisperModel(
     num_workers=1
 )
 
-# Mots FR -> fichier PNG emoji (overlay)
+# ===== EMOJI RULES (FR, sans accents) -> PNG =====
 EMOJI_RULES = [
-    # 💰 argent
     (["argent", "riche", "richesse", "million", "euros", "euro", "cash", "fortune"], "money.png"),
-
-    # 🏆 réussite
     (["succes", "reussir", "reussite", "gagner", "victoire", "recompense"], "trophy.png"),
-
-    # 🧠 mental
     (["cerveau", "mental", "esprit", "mindset", "penser", "reflechir"], "brain.png"),
-
-    # 💪 action / travail
     (["travail", "travaille", "travailler", "effort", "discipline", "constance", "persiste", "persister"], "fire.png"),
-
-    # ⏳ temps / vie
     (["temps", "minute", "jour", "jours", "vie"], "rocket.png"),
-
-    # ⚠️ blocage / echec / probleme
     (["bloque", "blocage", "echec", "echouer", "probleme", "risque", "danger"], "warning.png"),
-
-    # ❤️ émotion
     (["amour", "coeur"], "heart.png"),
 ]
-
 
 def strip_accents(s: str) -> str:
     s = s or ""
     s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    return s
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
 def norm_key(s: str) -> str:
     s = strip_accents(s).lower()
-    s = s.replace("’", "'")  # apostrophe “courbe” -> normale
+    s = s.replace("’", "'")
     return s
 
 @app.get("/")
@@ -69,19 +56,28 @@ def home():
 def health():
     return "ok", 200
 
-def get_duration_seconds(path):
-    p = subprocess.run([
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+# ===== UTILS =====
+
+def get_duration_seconds(path: str) -> float:
+    p = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    if p.returncode != 0 or not p.stdout.strip():
+        raise RuntimeError(p.stderr.strip() or "ffprobe failed")
     return float(p.stdout.strip())
 
-def normalize(t):
+def normalize(t: str) -> str:
     return re.sub(r"\s+", " ", (t or "")).strip()
 
-def split_cpl(text):
+def split_cpl(text: str):
     text = normalize(text)
     if not text:
         return []
@@ -98,7 +94,7 @@ def split_cpl(text):
         out.append(cur)
     return out
 
-def srt_ts(sec):
+def srt_ts(sec: float) -> str:
     ms = int(sec * 1000)
     h = ms // 3600000
     ms %= 3600000
@@ -115,11 +111,10 @@ def pick_emoji_file(text: str):
             return fname
     return None
 
-def make_srt_and_emoji_events(segments, srt_path):
+def make_srt_and_emoji_events(segments, srt_path: str):
     """
-    Génère:
-    - SRT (texte sans emoji unicode)
-    - events emoji: [(start, end, emoji_file)]
+    ✅ SRT: 1 ligne, max 14 caractères, durée fixe 500ms
+    ✅ Emoji: overlay PNG pendant 500ms, à côté du texte
     """
     lines = []
     events = []
@@ -137,11 +132,14 @@ def make_srt_and_emoji_events(segments, srt_path):
         if not parts:
             continue
 
-        dur = (end - start) / len(parts)
+        t = start
+        for ptxt in parts:
+            s = t
+            e = min(s + MAX_DURATION, end)
 
-        for i, ptxt in enumerate(parts):
-            s = start + i * dur
-            e = min(s + MAX_DURATION, start + (i + 1) * dur)
+            # stop si on dépasse le segment
+            if e <= s:
+                break
 
             lines.append(str(idx))
             lines.append(f"{srt_ts(s)} --> {srt_ts(e)}")
@@ -149,9 +147,10 @@ def make_srt_and_emoji_events(segments, srt_path):
             lines.append("")
             idx += 1
 
-            # ✅ emoji seulement à la fin "de la phrase" => on l’affiche pendant CE sous-titre
             if emoji_file:
                 events.append((s, e, emoji_file))
+
+            t = e  # avance bloc par bloc (500ms)
 
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -173,8 +172,8 @@ def render():
 
     try:
         duration = get_duration_seconds(apath)
-    except:
-        return {"error": "Cannot read audio duration"}, 500
+    except Exception as e:
+        return {"error": "Cannot read audio duration", "details": str(e)}, 500
 
     try:
         segments, _ = MODEL.transcribe(apath, vad_filter=True)
@@ -184,7 +183,6 @@ def render():
         return {"error": "Transcription failed", "details": str(e)}, 500
 
     # ---- FFmpeg: burn subtitles then overlay emojis (PNG) ----
-    # Inputs: 0=video, 1=audio, + one input per unique emoji PNG
     unique_emojis = []
     for _, _, f in emoji_events:
         if f not in unique_emojis:
@@ -194,23 +192,27 @@ def render():
     for f in unique_emojis:
         ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
 
-    # Base: subtitles on video
+    # Subtitle style (texte petit)
     force_style = "FontName=DejaVu Sans,FontSize=14,Outline=2,Shadow=1,MarginV=90"
+
     filter_steps = []
     filter_steps.append(f"[0:v]subtitles={srt}:force_style='{force_style}'[v0]")
 
-    # Overlay each event
+    # Emoji à côté du texte (à droite, même hauteur)
     current = "v0"
-    # position emoji: bottom-right-ish (tweak if you want)
-    # scale to 48px width
     for idx_ev, (s, e, fname) in enumerate(emoji_events):
-        inp_index = 2 + unique_emojis.index(fname)  # video=0, audio=1
+        inp_index = 2 + unique_emojis.index(fname)  # 0=video,1=audio,2+=png inputs
         next_v = f"v{idx_ev+1}"
+
+        # taille emoji
+        filter_steps.append(f"[{inp_index}:v]scale=44:-1[em{idx_ev}]")
+
+        # position: à droite du centre, aligné verticalement avec sous-titre
+        # ajuste +160 / +220 si tu veux plus proche/loin
         filter_steps.append(
-            f"[{inp_index}:v]scale=48:-1[em{idx_ev}]"
-        )
-        filter_steps.append(
-            f"[{current}][em{idx_ev}]overlay=x=W-w-40:y=H-h-140:enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
+            f"[{current}][em{idx_ev}]overlay="
+            f"x=(W/2)+190:y=H-h-95:"
+            f"enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
         )
         current = next_v
 
@@ -232,10 +234,9 @@ def render():
 
     p = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
-        return {"error": "ffmpeg failed", "stderr": p.stderr[-2000:]}, 500
+        return {"error": "ffmpeg failed", "stderr": p.stderr[-2500:]}, 500
 
     return send_file(out, mimetype="video/mp4")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
