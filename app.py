@@ -85,7 +85,7 @@ def home():
         "endpoints": {"health": "/health", "render": "/render"},
         "subtitle": {"cap_dur_ms": int(CAP_DUR * 1000), "max_cpl": MAX_CPL},
         "emoji": {"size": EMOJI_SIZE, "max_dur_s": EMOJI_MAX_DUR, "position": "center_exact"},
-        "audio": {"mode": "mix_video_audio_plus_added_audio", "video_vol": VIDEO_VOL, "added_vol": ADDED_AUDIO_VOL}
+        "audio": {"mode": "mix(video_audio + added_audio)", "video_vol": VIDEO_VOL, "added_vol": ADDED_AUDIO_VOL}
     }, 200
 
 @app.get("/health")
@@ -136,7 +136,6 @@ def pick_emoji_for_text(text: str):
 
 def make_emoji_events_from_captions(captions):
     """
-    ✅ Emoji appears when the keyword appears in the caption text.
     ✅ Only ONE occurrence per emoji type for the whole video.
     """
     events = []
@@ -240,13 +239,15 @@ def render():
     request.files["video"].save(vpath)
     request.files["audio"].save(apath)
 
-    # duration = audio duration (kept as before)
+    # ✅ Use LONGEST duration so we don't cut off the video audio
     try:
-        duration = get_duration_seconds(apath)
+        vdur = get_duration_seconds(vpath)
+        adur = get_duration_seconds(apath)
+        out_dur = max(vdur, adur)
     except Exception as e:
-        return {"error": "Cannot read audio duration", "details": str(e)}, 500
+        return {"error": "Cannot read media duration", "details": str(e)}, 500
 
-    # Whisper with word timestamps
+    # Whisper with word timestamps (we keep your logic)
     try:
         segments, _ = MODEL.transcribe(
             apath,
@@ -307,28 +308,25 @@ def render():
         )
         current = next_v
 
-    # ✅ Audio: keep video audio AND add provided audio (mix)
+    # ✅ AUDIO MIX (REAL): keep video audio + add uploaded audio
     has_vid_audio = video_has_audio(vpath)
     if has_vid_audio:
-        filter_steps.append(
-            f"[0:a]volume={VIDEO_VOL},aresample=async=1:first_pts=0[a0]"
-        )
-        filter_steps.append(
-            f"[1:a]volume={ADDED_AUDIO_VOL},aresample=async=1:first_pts=0[a1]"
-        )
-        filter_steps.append(
-            "[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
-        )
+        # Ensure both start at t=0, resample, and keep lengths
+        filter_steps.append(f"[0:a]volume={VIDEO_VOL},aresample=async=1:first_pts=0[a0]")
+        filter_steps.append(f"[1:a]volume={ADDED_AUDIO_VOL},aresample=async=1:first_pts=0[a1]")
+
+        # Mix both (no replacement). normalize=0 keeps true sum, so you hear both.
+        filter_steps.append("[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]")
         audio_map = "[aout]"
     else:
-        # fallback: if the video has no audio, just use added audio
+        # If video has no audio, just use added audio
         filter_steps.append(f"[1:a]volume={ADDED_AUDIO_VOL},aresample=async=1:first_pts=0[aout]")
         audio_map = "[aout]"
 
     filter_complex = ";".join(filter_steps)
 
     ffmpeg_cmd += [
-        "-t", str(duration),
+        "-t", str(out_dur),               # ✅ do not cut video audio anymore
         "-filter_complex", filter_complex,
         "-map", f"[{current}]",
         "-map", audio_map,
