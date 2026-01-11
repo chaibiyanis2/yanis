@@ -112,7 +112,7 @@ def render():
 
     # Style des sous-titres (simple et lisible)
     # Tu peux modifier Fontsize, Outline, Shadow, etc.
-    force_style = "FontName=DejaVu Sans,FontSize=48,Outline=3,Shadow=1,MarginV=80"
+    force_style = "FontName=DejaVu Sans,FontSize=14,Outline=2,Shadow=1,MarginV=90"
 
     cmd = [
         "ffmpeg", "-y",
@@ -148,3 +148,4 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
