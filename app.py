@@ -26,7 +26,7 @@ VIDEO_VOL = 1.0
 ADDED_AUDIO_VOL = 1.0
 
 # ✅ MICRO progressive zoom (whole video)
-# 1.00 -> 1.03 (change to 1.025 if you prefer)
+# Use 1.025 for 102.5% or 1.03 for 103%
 ZOOM_START = 1.00
 ZOOM_END = 1.03
 
@@ -87,7 +87,7 @@ def home():
         "model": WHISPER_MODEL_NAME,
         "endpoints": {"health": "/health", "render": "/render"},
         "subtitle": {"cap_dur_ms": int(CAP_DUR * 1000), "max_cpl": MAX_CPL},
-        "emoji": {"size": EMOJI_SIZE, "max_dur_s": EMOJI_MAX_DUR, "position": "center_exact"},
+        "emoji": {"size": EMOJI_SIZE, "max_dur_s": EMOJI_MAX_DUR, "position": "center_exact", "policy": "one_per_type_per_video"},
         "audio": {"mode": "mix(video_audio + added_audio)", "video_vol": VIDEO_VOL, "added_vol": ADDED_AUDIO_VOL},
         "zoom": {"start": ZOOM_START, "end": ZOOM_END}
     }, 200
@@ -227,6 +227,14 @@ def write_srt(captions, srt_path: str):
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
+def format_ffmpeg_cmd(cmd_list):
+    # safe printable command for debugging
+    def q(x):
+        if any(c in x for c in [' ', '"', "'", ';', '&', '(', ')', '[', ']', '{', '}', ':', ',']):
+            return '"' + x.replace('"', '\\"') + '"'
+        return x
+    return " ".join(q(x) for x in cmd_list)
+
 # =========================
 # MAIN
 # =========================
@@ -245,7 +253,7 @@ def render():
 
     # ✅ Video ends when MP3 ends
     try:
-        vdur = get_duration_seconds(vpath)
+        _vdur = get_duration_seconds(vpath)
         adur = get_duration_seconds(apath)
         out_dur = adur
     except Exception as e:
@@ -284,7 +292,7 @@ def render():
         if f not in unique_emojis:
             unique_emojis.append(f)
 
-    ffmpeg_cmd = ["ffmpeg", "-y", "-i", vpath, "-i", apath]
+    ffmpeg_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", vpath, "-i", apath]
     for f in unique_emojis:
         ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
 
@@ -292,20 +300,24 @@ def render():
 
     filter_steps = []
 
-    # ✅ MICRO progressive zoom over whole output duration, then subtitles on top
+    # ✅ MICRO progressive zoom that truly returns to original frame size
     # zoom(t) = start + (end-start) * t/out_dur
-    z_delta = (ZOOM_END - ZOOM_START)
     dur_s = max(0.001, float(out_dur))
+    z_delta = (ZOOM_END - ZOOM_START)
     zoom_expr = f"({ZOOM_START}+({z_delta})*t/{dur_s:.6f})"
 
-    filter_steps.append(
-        f"[0:v]"
+    # scale up, then crop back to original size using the SAME zoom_expr
+    # crop centered
+    # IMPORTANT: use iw/zoom_expr and ih/zoom_expr so output stays original size
+    zoom_chain = (
         f"scale=iw*{zoom_expr}:ih*{zoom_expr},"
-        f"crop=iw:ih,"
-        f"subtitles={srt_path}:force_style='{force_style}'"
-        f"[v0]"
+        f"crop=w=iw/{zoom_expr}:h=ih/{zoom_expr}:x=(iw-iw/{zoom_expr})/2:y=(ih-ih/{zoom_expr})/2"
     )
 
+    # Apply zoom first, then subtitles on top
+    filter_steps.append(
+        f"[0:v]{zoom_chain},subtitles={srt_path}:force_style='{force_style}'[v0]"
+    )
     current = "v0"
 
     # Emoji overlays at exact center (independent from subtitles)
@@ -354,7 +366,11 @@ def render():
 
     p = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
-        return {"error": "ffmpeg failed", "stderr": p.stderr[-2500:]}, 500
+        return {
+            "error": "ffmpeg failed",
+            "cmd": format_ffmpeg_cmd(ffmpeg_cmd),
+            "stderr": p.stderr  # ✅ full stderr (so you can see the real reason in n8n)
+        }, 500
 
     return send_file(out, mimetype="video/mp4")
 
