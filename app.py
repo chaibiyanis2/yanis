@@ -22,13 +22,18 @@ MARGIN_V = 90
 EMOJI_SIZE = 44
 EMOJI_MAX_DUR = 0.5
 
+# Audio mix volumes
 VIDEO_VOL = 1.0
 ADDED_AUDIO_VOL = 1.0
 
-# ✅ MICRO progressive zoom (whole video)
+# MICRO progressive zoom (whole video)
 ZOOM_START = 1.00
 ZOOM_END = 1.03   # or 1.025
 ZOOM_FPS = 30
+
+# Fallback size if ffprobe can't read the video size
+FALLBACK_W = 1080
+FALLBACK_H = 1920
 
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
@@ -90,30 +95,35 @@ def get_duration_seconds(path: str) -> float:
          "-of", "default=noprint_wrappers=1:nokey=1", path],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    if p.returncode != 0 or not p.stdout.strip():
-        raise RuntimeError(p.stderr.strip() or "ffprobe duration failed")
+    if p.returncode != 0 or not (p.stdout or "").strip():
+        raise RuntimeError((p.stderr or "").strip() or "ffprobe duration failed")
     return float(p.stdout.strip())
 
 def get_video_size(path: str):
     """
-    Robust: try CSV then JSON.
-    Returns (width, height) as ints.
+    Robust width/height reader.
+    Tries:
+      1) default format (width newline height)
+      2) json format
     """
-    # 1) CSV attempt
+    # 1) default output: width\nheight\n
     p1 = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height",
-         "-of", "csv=p=0:s=x", path],
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    out1 = (p1.stdout or "").strip()
-    if p1.returncode == 0 and out1 and "x" in out1:
-        w_str, h_str = out1.split("x", 1)
-        w, h = int(w_str), int(h_str)
-        if w > 0 and h > 0:
-            return w, h
+    out1 = (p1.stdout or "").strip().splitlines()
+    if p1.returncode == 0 and len(out1) >= 2:
+        try:
+            w = int(out1[0].strip())
+            h = int(out1[1].strip())
+            if w > 0 and h > 0:
+                return w, h
+        except Exception:
+            pass
 
-    # 2) JSON attempt
+    # 2) json
     p2 = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height",
@@ -133,10 +143,9 @@ def get_video_size(path: str):
         except Exception:
             pass
 
-    # 3) fail with useful info
     raise RuntimeError(
         "ffprobe video size failed. "
-        f"csv_stdout='{out1}' csv_stderr='{(p1.stderr or '').strip()}' "
+        f"default_stderr='{(p1.stderr or '').strip()}' "
         f"json_stderr='{(p2.stderr or '').strip()}'"
     )
 
@@ -170,7 +179,7 @@ def pick_emoji_for_text(text: str):
     return None
 
 def make_emoji_events_from_captions(captions):
-    # ✅ only one per emoji type for whole video
+    # Only ONE occurrence per emoji type for whole video
     events = []
     used_types = set()
     for (s, e, text) in captions:
@@ -267,13 +276,17 @@ def render():
     request.files["video"].save(vpath)
     request.files["audio"].save(apath)
 
-    # ✅ output ends when mp3 ends + need video size for zoompan
+    # Output ends when MP3 ends + need video size for zoompan (with fallback)
     try:
-        adur = get_duration_seconds(apath)
-        out_dur = adur
-        vw, vh = get_video_size(vpath)
+        out_dur = get_duration_seconds(apath)
     except Exception as e:
-        return {"error": "Cannot read media info", "details": str(e)}, 500
+        return {"error": "Cannot read media info", "details": f"Audio duration failed: {str(e)}"}, 500
+
+    try:
+        vw, vh = get_video_size(vpath)
+    except Exception:
+        # ✅ fallback instead of failing the whole request
+        vw, vh = FALLBACK_W, FALLBACK_H
 
     # Transcribe added audio
     try:
@@ -297,7 +310,6 @@ def render():
     except Exception as e:
         return {"error": "Transcription failed", "details": str(e)}, 500
 
-    # unique emoji inputs
     unique_emojis = []
     for _, _, f, _ in emoji_events:
         if f not in unique_emojis:
@@ -309,7 +321,7 @@ def render():
 
     force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
-    # zoompan (stable)
+    # stable zoompan
     total_frames = max(2, int(out_dur * ZOOM_FPS))
     z_delta = (ZOOM_END - ZOOM_START)
 
