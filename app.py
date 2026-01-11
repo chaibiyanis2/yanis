@@ -13,24 +13,25 @@ app = Flask(__name__)
 # =========================
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
 
-MAX_CPL = 14            # max characters per subtitle line
-CAP_DUR = 0.5           # 500ms per caption block
+MAX_CPL = 14
+CAP_DUR = 0.5
 FONT_SIZE = 14
 MARGIN_V = 90
 
-EMOJI_SIZE = 44         # emoji PNG size (px)
-EMOJI_MAX_DUR = 0.5     # seconds: cap emoji display duration (<= caption duration)
+EMOJI_SIZE = 44
+EMOJI_MAX_DUR = 0.5
 
-# ✅ Audio mix volumes (video sound + added audio)
+# ✅ Audio mix volumes
 VIDEO_VOL = 1.0
 ADDED_AUDIO_VOL = 1.0
 
 # ✅ MICRO progressive zoom (whole video)
-# Use 1.025 for 102.5% or 1.03 for 103%
 ZOOM_START = 1.00
-ZOOM_END = 1.03
+ZOOM_END = 1.03  # or 1.025
 
-# Whisper low-RAM
+# ✅ Zoompan FPS (stable)
+ZOOM_FPS = 30
+
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
     device="cpu",
@@ -40,8 +41,7 @@ MODEL = WhisperModel(
 )
 
 # =========================
-# EMOJI RULES (FR, accent-insensitive) -> PNG filenames
-# One rule = one "type" (one emoji file)
+# EMOJI RULES
 # =========================
 EMOJI_RULES = [
     (["argent", "riche", "richesse", "million", "euros", "euro", "cash", "fortune"], "money.png"),
@@ -54,7 +54,7 @@ EMOJI_RULES = [
 ]
 
 # =========================
-# TEXT NORMALIZATION (fix d 'etre -> d'etre)
+# TEXT NORMALIZATION
 # =========================
 APOS = "'"
 
@@ -79,19 +79,6 @@ def normalize_text(s: str) -> str:
 # =========================
 # ROUTES
 # =========================
-@app.get("/")
-def home():
-    return {
-        "service": "ffmpeg-whisper-subtitles-emoji-overlay",
-        "status": "online",
-        "model": WHISPER_MODEL_NAME,
-        "endpoints": {"health": "/health", "render": "/render"},
-        "subtitle": {"cap_dur_ms": int(CAP_DUR * 1000), "max_cpl": MAX_CPL},
-        "emoji": {"size": EMOJI_SIZE, "max_dur_s": EMOJI_MAX_DUR, "position": "center_exact", "policy": "one_per_type_per_video"},
-        "audio": {"mode": "mix(video_audio + added_audio)", "video_vol": VIDEO_VOL, "added_vol": ADDED_AUDIO_VOL},
-        "zoom": {"start": ZOOM_START, "end": ZOOM_END}
-    }, 200
-
 @app.get("/health")
 def health():
     return "ok", 200
@@ -108,6 +95,19 @@ def get_duration_seconds(path: str) -> float:
     if p.returncode != 0 or not p.stdout.strip():
         raise RuntimeError(p.stderr.strip() or "ffprobe failed")
     return float(p.stdout.strip())
+
+def get_video_size(path: str):
+    # returns (width, height)
+    p = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "csv=s=x:p=0", path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if p.returncode != 0 or not p.stdout.strip() or "x" not in p.stdout.strip():
+        raise RuntimeError(p.stderr.strip() or "ffprobe video size failed")
+    w_str, h_str = p.stdout.strip().split("x")
+    return int(w_str), int(h_str)
 
 def video_has_audio(path: str) -> bool:
     p = subprocess.run(
@@ -139,33 +139,27 @@ def pick_emoji_for_text(text: str):
     return None
 
 def make_emoji_events_from_captions(captions):
-    """
-    ✅ Only ONE occurrence per emoji type for the whole video.
-    """
+    # ✅ only one per emoji type for the whole video
     events = []
     used_types = set()
-
     for (s, e, text) in captions:
         emoji = pick_emoji_for_text(text)
         if not emoji:
             continue
         if emoji in used_types:
             continue
-
         e2 = min(e, s + EMOJI_MAX_DUR)
         events.append((s, e2, emoji, text))
         used_types.add(emoji)
-
     return events
 
 # =========================
-# SUBTITLE BUILDERS (word timestamps)
+# SUBTITLE BUILDERS
 # =========================
 def split_cpl_words(words, max_cpl: int):
     groups = []
     cur = []
     cur_len = 0
-
     for wd in words:
         w = wd["w"]
         add_len = len(w) + (1 if cur else 0)
@@ -176,7 +170,6 @@ def split_cpl_words(words, max_cpl: int):
         else:
             cur.append(wd)
             cur_len += add_len
-
     if cur:
         groups.append(cur)
     return groups
@@ -227,14 +220,6 @@ def write_srt(captions, srt_path: str):
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-def format_ffmpeg_cmd(cmd_list):
-    # safe printable command for debugging
-    def q(x):
-        if any(c in x for c in [' ', '"', "'", ';', '&', '(', ')', '[', ']', '{', '}', ':', ',']):
-            return '"' + x.replace('"', '\\"') + '"'
-        return x
-    return " ".join(q(x) for x in cmd_list)
-
 # =========================
 # MAIN
 # =========================
@@ -251,21 +236,17 @@ def render():
     request.files["video"].save(vpath)
     request.files["audio"].save(apath)
 
-    # ✅ Video ends when MP3 ends
+    # ✅ output ends when mp3 ends
     try:
-        _vdur = get_duration_seconds(vpath)
         adur = get_duration_seconds(apath)
         out_dur = adur
+        vw, vh = get_video_size(vpath)
     except Exception as e:
-        return {"error": "Cannot read media duration", "details": str(e)}, 500
+        return {"error": "Cannot read media info", "details": str(e)}, 500
 
-    # Whisper with word timestamps (based on added audio)
+    # Transcribe added audio (as before)
     try:
-        segments, _ = MODEL.transcribe(
-            apath,
-            vad_filter=True,
-            word_timestamps=True
-        )
+        segments, _ = MODEL.transcribe(apath, vad_filter=True, word_timestamps=True)
 
         all_words = []
         for seg in segments:
@@ -280,47 +261,47 @@ def render():
 
         captions = build_captions_from_words(all_words)
         write_srt(captions, srt_path)
-
         emoji_events = make_emoji_events_from_captions(captions)
 
     except Exception as e:
         return {"error": "Transcription failed", "details": str(e)}, 500
 
-    # ---------- FFmpeg filters ----------
+    # unique emoji inputs
     unique_emojis = []
     for _, _, f, _ in emoji_events:
         if f not in unique_emojis:
             unique_emojis.append(f)
 
-    ffmpeg_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", vpath, "-i", apath]
+    ffmpeg_cmd = ["ffmpeg", "-y", "-i", vpath, "-i", apath]
     for f in unique_emojis:
         ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
 
     force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
+    # ✅ stable progressive zoom with zoompan (no crop math that crashes)
+    total_frames = max(2, int(out_dur * ZOOM_FPS))
+    z_delta = (ZOOM_END - ZOOM_START)
+
+    # zoom increases from start to end over total_frames
+    zoom_expr = f"{ZOOM_START}+({z_delta})*on/{total_frames}"
+    # keep centered
+    x_expr = "iw/2-(iw/zoom/2)"
+    y_expr = "ih/2-(ih/zoom/2)"
+
     filter_steps = []
 
-    # ✅ MICRO progressive zoom that truly returns to original frame size
-    # zoom(t) = start + (end-start) * t/out_dur
-    dur_s = max(0.001, float(out_dur))
-    z_delta = (ZOOM_END - ZOOM_START)
-    zoom_expr = f"({ZOOM_START}+({z_delta})*t/{dur_s:.6f})"
-
-    # scale up, then crop back to original size using the SAME zoom_expr
-    # crop centered
-    # IMPORTANT: use iw/zoom_expr and ih/zoom_expr so output stays original size
-    zoom_chain = (
-        f"scale=iw*{zoom_expr}:ih*{zoom_expr},"
-        f"crop=w=iw/{zoom_expr}:h=ih/{zoom_expr}:x=(iw-iw/{zoom_expr})/2:y=(ih-ih/{zoom_expr})/2"
-    )
-
-    # Apply zoom first, then subtitles on top
+    # zoom -> subtitles
     filter_steps.append(
-        f"[0:v]{zoom_chain},subtitles={srt_path}:force_style='{force_style}'[v0]"
+        f"[0:v]fps={ZOOM_FPS},"
+        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d=1:s={vw}x{vh},"
+        f"setpts=PTS-STARTPTS,"
+        f"subtitles={srt_path}:force_style='{force_style}'"
+        f"[v0]"
     )
+
     current = "v0"
 
-    # Emoji overlays at exact center (independent from subtitles)
+    # emojis centered
     x_center = "(W-w)/2"
     y_center = "(H-h)/2"
 
@@ -336,9 +317,8 @@ def render():
         )
         current = next_v
 
-    # Audio mix: keep video audio + added audio
-    has_vid_audio = video_has_audio(vpath)
-    if has_vid_audio:
+    # audio mix
+    if video_has_audio(vpath):
         filter_steps.append(f"[0:a]volume={VIDEO_VOL},aresample=async=1:first_pts=0[a0]")
         filter_steps.append(f"[1:a]volume={ADDED_AUDIO_VOL},aresample=async=1:first_pts=0[a1]")
         filter_steps.append("[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]")
@@ -350,7 +330,7 @@ def render():
     filter_complex = ";".join(filter_steps)
 
     ffmpeg_cmd += [
-        "-t", str(out_dur),               # ✅ cut output to MP3 duration
+        "-t", str(out_dur),                 # ✅ end when mp3 ends
         "-filter_complex", filter_complex,
         "-map", f"[{current}]",
         "-map", audio_map,
@@ -366,11 +346,7 @@ def render():
 
     p = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
-        return {
-            "error": "ffmpeg failed",
-            "cmd": format_ffmpeg_cmd(ffmpeg_cmd),
-            "stderr": p.stderr  # ✅ full stderr (so you can see the real reason in n8n)
-        }, 500
+        return {"error": "ffmpeg failed", "stderr": p.stderr[-4000:]}, 500
 
     return send_file(out, mimetype="video/mp4")
 
