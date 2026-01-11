@@ -18,9 +18,11 @@ CAP_DUR = 0.5           # ✅ 500ms per caption block
 FONT_SIZE = 14
 MARGIN_V = 90
 
+# Emoji placement (ABOVE subtitles)
 EMOJI_SIZE = 44         # emoji PNG size (px)
-EMOJI_RAISE_PX = 40     # emoji higher than subtitle baseline
-EMOJI_GAP_PX = 10       # horizontal gap between text and emoji
+EMOJI_ABOVE_GAP_PX = 10 # ✅ distance (px) between emoji and subtitle
+# Estimate subtitle box height in px (Font + outline/shadow). Used to position emoji above the subtitle.
+SUBTITLE_EST_H_PX = int(FONT_SIZE * 1.6) + 8
 
 # Emoji display behavior
 EMOJI_COOLDOWN = 0.8    # seconds: prevents spam of same emoji too often
@@ -88,7 +90,11 @@ def home():
         "model": WHISPER_MODEL_NAME,
         "endpoints": {"health": "/health", "render": "/render"},
         "subtitle": {"cap_dur_ms": int(CAP_DUR * 1000), "max_cpl": MAX_CPL},
-        "emoji": {"size": EMOJI_SIZE, "raise_px": EMOJI_RAISE_PX, "cooldown_s": EMOJI_COOLDOWN}
+        "emoji": {
+            "size": EMOJI_SIZE,
+            "above_gap_px": EMOJI_ABOVE_GAP_PX,
+            "cooldown_s": EMOJI_COOLDOWN
+        }
     }, 200
 
 @app.get("/health")
@@ -224,11 +230,6 @@ def build_captions_from_words(all_words):
 
     return captions
 
-def estimate_text_half_width_px(text: str) -> int:
-    # Approx for centered subtitles: width ~ 0.58*fontsize per char
-    n = len(text)
-    return int((n * FONT_SIZE * 0.58) / 2)
-
 def write_srt(captions, srt_path: str):
     lines = []
     for idx, (s, e, text) in enumerate(captions, start=1):
@@ -283,7 +284,7 @@ def render():
         captions = build_captions_from_words(all_words)
         write_srt(captions, srt_path)
 
-        # ✅ emoji timing based on caption text
+        # ✅ emoji timing based on caption text (so emoji shows when that caption is shown)
         emoji_events = make_emoji_events_from_captions(captions)
 
     except Exception as e:
@@ -299,29 +300,35 @@ def render():
     for f in unique_emojis:
         ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
 
-    force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
+    # Force ASS/Libass style: centered bottom
+    force_style = (
+        f"FontName=DejaVu Sans,"
+        f"FontSize={FONT_SIZE},"
+        f"Outline=2,"
+        f"Shadow=1,"
+        f"Alignment=2,"
+        f"MarginV={MARGIN_V}"
+    )
 
     filter_steps = []
     filter_steps.append(f"[0:v]subtitles={srt_path}:force_style='{force_style}'[v0]")
 
     current = "v0"
 
-    for idx_ev, (s, e, fname, shown_text) in enumerate(emoji_events):
+    # ✅ Emoji ABOVE subtitle, centered, with EXACT 10px gap
+    # Subtitle bottom is approximately at: y_sub_bottom = H - MarginV
+    # Emoji top y = y_sub_bottom - subtitle_est_h - gap - emoji_h
+    x_expr = "(W-w)/2"
+    y_expr = f"H-{MARGIN_V}-{SUBTITLE_EST_H_PX}-{EMOJI_ABOVE_GAP_PX}-h"
+
+    for idx_ev, (s, e, fname, _shown_text) in enumerate(emoji_events):
         inp_index = 2 + unique_emojis.index(fname)
         next_v = f"v{idx_ev+1}"
 
         filter_steps.append(f"[{inp_index}:v]scale={EMOJI_SIZE}:-1[em{idx_ev}]")
-
-        # place next to centered caption text
-        half_w = estimate_text_half_width_px(shown_text)
-        x_px = half_w + EMOJI_GAP_PX
-
-        # higher than subtitle
-        y_expr = f"H-h-{MARGIN_V + EMOJI_RAISE_PX}"
-
         filter_steps.append(
             f"[{current}][em{idx_ev}]overlay="
-            f"x=(W/2)+{x_px}:y={y_expr}:"
+            f"x={x_expr}:y={y_expr}:"
             f"enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
         )
 
