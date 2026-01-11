@@ -16,19 +16,22 @@ WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
 MAX_CPL = 14            # max characters per subtitle line
 CAP_DUR = 0.5           # ✅ 500ms per caption block
 FONT_SIZE = 14
-MARGIN_V = 90
+MARGIN_V = 90           # distance from bottom for subtitles
 
-# Emoji placement (ABOVE subtitles)
+# Emoji placement (ABOVE subtitles, NOT horizontally centered)
 EMOJI_SIZE = 44         # emoji PNG size (px)
-EMOJI_ABOVE_GAP_PX = 10 # ✅ distance (px) between emoji and subtitle
-# Estimate subtitle box height in px (Font + outline/shadow). Used to position emoji above the subtitle.
+EMOJI_ABOVE_GAP_PX = 10 # ✅ distance between emoji and subtitle (vertical)
+EMOJI_EXTRA_RAISE_PX = 6  # raise a bit more if needed
+EMOJI_X_INSET_PX = 6      # move a bit right from subtitle start (tweak if needed)
+
+# We estimate subtitle box height (used to place emoji above subtitle)
 SUBTITLE_EST_H_PX = int(FONT_SIZE * 1.6) + 8
 
 # Emoji display behavior
 EMOJI_COOLDOWN = 0.8    # seconds: prevents spam of same emoji too often
 EMOJI_MAX_DUR = 0.5     # seconds: cap emoji display duration (<= caption duration)
 
-# Whisper low-RAM (Render Free friendly)
+# Whisper low-RAM
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
     device="cpu",
@@ -93,6 +96,8 @@ def home():
         "emoji": {
             "size": EMOJI_SIZE,
             "above_gap_px": EMOJI_ABOVE_GAP_PX,
+            "extra_raise_px": EMOJI_EXTRA_RAISE_PX,
+            "x_inset_px": EMOJI_X_INSET_PX,
             "cooldown_s": EMOJI_COOLDOWN
         }
     }, 200
@@ -230,6 +235,11 @@ def build_captions_from_words(all_words):
 
     return captions
 
+def estimate_text_half_width_px(text: str) -> int:
+    # Approx for centered subtitles: width ~ 0.58*fontsize per char
+    n = len(text)
+    return int((n * FONT_SIZE * 0.58) / 2)
+
 def write_srt(captions, srt_path: str):
     lines = []
     for idx, (s, e, text) in enumerate(captions, start=1):
@@ -284,7 +294,7 @@ def render():
         captions = build_captions_from_words(all_words)
         write_srt(captions, srt_path)
 
-        # ✅ emoji timing based on caption text (so emoji shows when that caption is shown)
+        # ✅ emoji timing based on caption text
         emoji_events = make_emoji_events_from_captions(captions)
 
     except Exception as e:
@@ -300,7 +310,7 @@ def render():
     for f in unique_emojis:
         ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
 
-    # Force ASS/Libass style: centered bottom
+    # ASS/Libass style (centered subtitles bottom)
     force_style = (
         f"FontName=DejaVu Sans,"
         f"FontSize={FONT_SIZE},"
@@ -315,20 +325,27 @@ def render():
 
     current = "v0"
 
-    # ✅ Emoji ABOVE subtitle, centered, with EXACT 10px gap
-    # Subtitle bottom is approximately at: y_sub_bottom = H - MarginV
-    # Emoji top y = y_sub_bottom - subtitle_est_h - gap - emoji_h
-    x_expr = "(W-w)/2"
-    y_expr = f"H-{MARGIN_V}-{SUBTITLE_EST_H_PX}-{EMOJI_ABOVE_GAP_PX}-h"
-
-    for idx_ev, (s, e, fname, _shown_text) in enumerate(emoji_events):
+    for idx_ev, (s, e, fname, shown_text) in enumerate(emoji_events):
         inp_index = 2 + unique_emojis.index(fname)
         next_v = f"v{idx_ev+1}"
 
+        # scale emoji
         filter_steps.append(f"[{inp_index}:v]scale={EMOJI_SIZE}:-1[em{idx_ev}]")
+
+        # ✅ X: align emoji above the START of the centered subtitle (not centered)
+        half_w = estimate_text_half_width_px(shown_text)
+        # left edge approx = W/2 - half_w
+        # clamp inside [0, W-w]
+        x_expr = f"max(0,min(W-w,(W/2)-{half_w}+{EMOJI_X_INSET_PX}))"
+
+        # ✅ Y: emoji ABOVE subtitle with 10px gap (plus extra raise)
+        # subtitle bottom approx = H - MarginV
+        # go up by subtitle height + gap + emoji height (+ extra)
+        y_expr = f"H-{MARGIN_V}-{SUBTITLE_EST_H_PX}-{EMOJI_ABOVE_GAP_PX}-h-{EMOJI_EXTRA_RAISE_PX}"
+
         filter_steps.append(
             f"[{current}][em{idx_ev}]overlay="
-            f"x={x_expr}:y={y_expr}:"
+            f"x='{x_expr}':y='{y_expr}':"
             f"enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
         )
 
