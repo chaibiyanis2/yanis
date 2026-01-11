@@ -184,7 +184,7 @@ def render():
         "-i", vpath,
         "-i", apath,
         "-t", str(duration),
-        "-vf", f"subtitles={srt}:force_style='FontName=DejaVu Sans,FontSize=14,Outline=2,Shadow=1,MarginV=90'",
+        "-vf", f"subtitles={srt}:force_style='FontName=Noto Color Emoji,FontSize=14,Outline=2,Shadow=1,MarginV=90'",
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-c:v", "libx264",
@@ -206,3 +206,4 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
