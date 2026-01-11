@@ -8,8 +8,13 @@ app = Flask(__name__)
 
 # Cache du modèle pour éviter de le recharger à chaque requête
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base")  # "tiny" / "base" / "small"
-MODEL = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
-
+MODEL = WhisperModel(
+    WHISPER_MODEL_NAME,
+    device="cpu",
+    compute_type="int8",
+    cpu_threads=1,
+    num_workers=1
+)
 
 @app.get("/")
 def home():
@@ -148,4 +153,5 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
