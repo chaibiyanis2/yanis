@@ -229,10 +229,11 @@ def render():
 
         # y aligné sur la même zone que les sous-titres (bas)
         filter_steps.append(
-            f"[{current}][em{idx_ev}]overlay="
-            f"x=(W/2)+{x_px}:y=H-h-{MARGIN_V + 5}:"
-            f"enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
-        )
+    f"[{current}][em{idx_ev}]overlay="
+    f"x=(W/2)+{x_px}:y=H-h-{MARGIN_V + 30}:"
+    f"enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
+)
+
         current = next_v
 
     filter_complex = ";".join(filter_steps)
@@ -259,3 +260,4 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
