@@ -15,12 +15,14 @@ WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
 
 MAX_CPL = 14            # max characters per subtitle line
 CAP_DUR = 0.5           # ✅ 500ms per caption block
+
 FONT_SIZE = 14
 MARGIN_V = 90
 
 EMOJI_SIZE = 44         # emoji PNG size (px)
+EMOJI_GAP_PX = 10       # horizontal gap between text and emoji
+EMOJI_UP_PX = 10        # ✅ emoji a bit ABOVE the subtitle line (small offset)
 
-# Emoji display behavior
 EMOJI_COOLDOWN = 0.8    # seconds: prevents spam of same emoji too often
 EMOJI_MAX_DUR = 0.5     # seconds: cap emoji display duration (<= caption duration)
 
@@ -86,7 +88,7 @@ def home():
         "model": WHISPER_MODEL_NAME,
         "endpoints": {"health": "/health", "render": "/render"},
         "subtitle": {"cap_dur_ms": int(CAP_DUR * 1000), "max_cpl": MAX_CPL},
-        "emoji": {"size": EMOJI_SIZE, "cooldown_s": EMOJI_COOLDOWN, "position": "center_exact"}
+        "emoji": {"size": EMOJI_SIZE, "gap_px": EMOJI_GAP_PX, "up_px": EMOJI_UP_PX}
     }, 200
 
 @app.get("/health")
@@ -117,7 +119,7 @@ def srt_ts(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 # =========================
-# EMOJI PICKERS
+# EMOJI HELPERS
 # =========================
 def pick_emoji_for_text(text: str):
     t = norm_key(text)
@@ -130,7 +132,7 @@ def make_emoji_events_from_captions(captions):
     """
     ✅ Emoji appears when the keyword appears in the caption text.
     ✅ Prevents spam: no same emoji too often (cooldown).
-    ✅ Output: [(s, e, emoji_file, caption_text)]
+    Output: [(s, e, emoji_file, caption_text)]
     """
     events = []
     last_emoji = None
@@ -158,14 +160,9 @@ def make_emoji_events_from_captions(captions):
 # SUBTITLE BUILDERS (word timestamps)
 # =========================
 def split_cpl_words(words, max_cpl: int):
-    """
-    words: list of {"w": str, "s": float, "e": float}
-    returns list[list[word]]
-    """
     groups = []
     cur = []
     cur_len = 0
-
     for wd in words:
         w = wd["w"]
         add_len = len(w) + (1 if cur else 0)
@@ -176,16 +173,15 @@ def split_cpl_words(words, max_cpl: int):
         else:
             cur.append(wd)
             cur_len += add_len
-
     if cur:
         groups.append(cur)
     return groups
 
 def build_captions_from_words(all_words):
     """
-    ✅ Builds captions using word timestamps.
+    ✅ Captions based on word timestamps.
     ✅ Each block spans up to CAP_DUR (0.5s).
-    returns: list of (s, e, text)
+    Returns: list of (s, e, text)
     """
     captions = []
     i = 0
@@ -222,6 +218,11 @@ def build_captions_from_words(all_words):
 
     return captions
 
+def estimate_text_half_width_px(text: str) -> int:
+    # Approx for centered subtitles: width ~ 0.58*fontsize per char
+    n = len(text)
+    return int((n * FONT_SIZE * 0.58) / 2)
+
 def write_srt(captions, srt_path: str):
     lines = []
     for idx, (s, e, text) in enumerate(captions, start=1):
@@ -248,13 +249,11 @@ def render():
     request.files["video"].save(vpath)
     request.files["audio"].save(apath)
 
-    # duration = audio duration
     try:
         duration = get_duration_seconds(apath)
     except Exception as e:
         return {"error": "Cannot read audio duration", "details": str(e)}, 500
 
-    # Whisper with word timestamps
     try:
         segments, _ = MODEL.transcribe(
             apath,
@@ -276,7 +275,6 @@ def render():
         captions = build_captions_from_words(all_words)
         write_srt(captions, srt_path)
 
-        # ✅ emoji timing based on caption text
         emoji_events = make_emoji_events_from_captions(captions)
 
     except Exception as e:
@@ -292,6 +290,7 @@ def render():
     for f in unique_emojis:
         ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
 
+    # Subtitle style
     force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
     filter_steps = []
@@ -299,19 +298,27 @@ def render():
 
     current = "v0"
 
-    # ✅ Emoji always at exact CENTER of the video (independent from subtitles)
-    x_center = "(W-w)/2"
-    y_center = "(H-h)/2"
-
-    for idx_ev, (s, e, fname, _shown_text) in enumerate(emoji_events):
+    for idx_ev, (s, e, fname, shown_text) in enumerate(emoji_events):
         inp_index = 2 + unique_emojis.index(fname)
         next_v = f"v{idx_ev+1}"
 
+        # emoji size
         filter_steps.append(f"[{inp_index}:v]scale={EMOJI_SIZE}:-1[em{idx_ev}]")
+
+        # x: next to centered text
+        half_w = estimate_text_half_width_px(shown_text)
+        x_px = half_w + EMOJI_GAP_PX
+
+        # ✅ y: vertically "centered" on text line but slightly above it
+        # baseline approx = H - MARGIN_V - (FONT_SIZE * 0.8)
+        # we want emoji center near baseline, so:
+        # y = baseline - (emoji_h/2) - EMOJI_UP_PX
+        baseline_px = int(FONT_SIZE * 0.8)
+        y_expr = f"(H-{MARGIN_V}-{baseline_px})-(h/2)-{EMOJI_UP_PX}"
 
         filter_steps.append(
             f"[{current}][em{idx_ev}]overlay="
-            f"x={x_center}:y={y_center}:"
+            f"x=(W/2)+{x_px}:y={y_expr}:"
             f"enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
         )
 
