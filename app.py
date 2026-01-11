@@ -23,7 +23,7 @@ EMOJI_SIZE = 44         # emoji PNG size (px)
 # Emoji display behavior
 EMOJI_MAX_DUR = 0.5     # seconds: cap emoji display duration (<= caption duration)
 
-# NEW: if audio is longer than video, slow video to exactly 16s
+# NEW: if audio is longer than video, slow video toward 16s, then CUT output to audio length (no silence)
 TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER = 16.0
 
 # Whisper low-RAM (Render Free friendly)
@@ -96,7 +96,7 @@ def home():
             "policy": "one_per_type_per_video"
         },
         "video_speed": {
-            "if_audio_longer_than_video": f"slow_to_{TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER:.0f}s_then_trim_audio"
+            "if_audio_longer_than_video": "slow_video_then_cut_to_audio_end (no_silence)"
         }
     }, 200
 
@@ -131,9 +131,6 @@ def srt_ts(sec: float) -> str:
 # EMOJI PICKERS
 # =========================
 def pick_emoji_for_text(text: str):
-    """
-    Returns emoji filename (type) or None
-    """
     t = norm_key(text)
     for keywords, fname in EMOJI_RULES:
         if any(k in t for k in keywords):
@@ -167,10 +164,6 @@ def make_emoji_events_from_captions(captions):
 # SUBTITLE BUILDERS (word timestamps)
 # =========================
 def split_cpl_words(words, max_cpl: int):
-    """
-    words: list of {"w": str, "s": float, "e": float}
-    returns list[list[word]]
-    """
     groups = []
     cur = []
     cur_len = 0
@@ -191,11 +184,6 @@ def split_cpl_words(words, max_cpl: int):
     return groups
 
 def build_captions_from_words(all_words):
-    """
-    ✅ Builds captions using word timestamps.
-    ✅ Each block spans up to CAP_DUR (0.5s).
-    returns: list of (s, e, text)
-    """
     captions = []
     i = 0
     n = len(all_words)
@@ -264,12 +252,14 @@ def render():
     except Exception as e:
         return {"error": "Cannot read media duration", "details": str(e)}, 500
 
-    # ✅ NEW BEHAVIOR:
-    # If audio longer than video -> slow video so output video is exactly 16s,
-    # then trim audio to match this 16s.
-    # Otherwise keep old behavior: output duration follows audio duration.
-    slow_to_16 = (audio_duration > video_duration and video_duration > 0.05)
-    target_out_duration = TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER if slow_to_16 else audio_duration
+    # If audio longer than video -> slow video (toward 16s), but FINAL output ends with audio (no silence)
+    slow_mode = (audio_duration > video_duration and video_duration > 0.05)
+
+    # FINAL output duration: always ends with audio (and if slow_mode, cannot exceed slowed video length = 16s)
+    if slow_mode:
+        target_out_duration = min(audio_duration, TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER)
+    else:
+        target_out_duration = audio_duration
 
     # Whisper with word timestamps
     try:
@@ -292,7 +282,6 @@ def render():
 
         captions = build_captions_from_words(all_words)
         write_srt(captions, srt_path)
-
         emoji_events = make_emoji_events_from_captions(captions)
 
     except Exception as e:
@@ -312,11 +301,9 @@ def render():
 
     filter_steps = []
 
-    # ✅ IMPORTANT: if we slow the video, do it BEFORE subtitles/emoji overlays
-    # so subtitle/emoji times remain aligned to audio timeline.
-    if slow_to_16:
-        speed_factor = TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER / video_duration
-        # speed_factor > 1.0 => slow motion
+    # If slow_mode: slow the video so it reaches 16s (timeline becomes longer), then apply subtitles
+    if slow_mode:
+        speed_factor = TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER / video_duration  # >1 => slow
         filter_steps.append(f"[0:v]setpts=PTS*{speed_factor:.8f}[vpre]")
         filter_steps.append(f"[vpre]subtitles={srt_path}:force_style='{force_style}'[v0]")
     else:
@@ -324,7 +311,7 @@ def render():
 
     current = "v0"
 
-    # ✅ Emoji always at exact CENTER of the video (independent from subtitles)
+    # Emoji centered in video
     x_center = "(W-w)/2"
     y_center = "(H-h)/2"
 
@@ -340,7 +327,10 @@ def render():
         )
         current = next_v
 
-    # ✅ Audio trimming to match target duration (16s when slowed, otherwise audio duration)
+    # ✅ CUT VIDEO to audio end (no silence)
+    filter_steps.append(f"[{current}]trim=0:{target_out_duration:.3f},setpts=PTS-STARTPTS[vout]")
+
+    # ✅ CUT AUDIO to same end
     filter_steps.append(f"[1:a]atrim=0:{target_out_duration:.3f},asetpts=PTS-STARTPTS[a0]")
 
     filter_complex = ";".join(filter_steps)
@@ -348,7 +338,7 @@ def render():
     ffmpeg_cmd += [
         "-t", f"{target_out_duration:.3f}",
         "-filter_complex", filter_complex,
-        "-map", f"[{current}]",
+        "-map", "[vout]",
         "-map", "[a0]",
         "-c:v", "libx264",
         "-preset", "ultrafast",
