@@ -7,52 +7,10 @@ from faster_whisper import WhisperModel
 
 app = Flask(__name__)
 
-# ===== CONFIG =====
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
 MAX_CPL = 14
 MAX_DURATION = 2.0
 
-# ===== EMOJIS FR =====
-EMOJI_MAP = {
-    "argent": "💰",
-    "riche": "💰",
-    "richesse": "💰",
-    "million": "💰",
-    "business": "📈",
-    "succès": "🏆",
-    "réussir": "🏆",
-    "réussite": "🏆",
-    "gagner": "🏆",
-    "temps": "⏳",
-    "vie": "⏳",
-    "jour": "📅",
-    "cerveau": "🧠",
-    "mental": "🧠",
-    "esprit": "🧠",
-    "discipline": "💪",
-    "travaille": "💪",
-    "fort": "💪",
-    "peur": "😨",
-    "stress": "😰",
-    "danger": "🔥",
-    "maintenant": "🚀",
-    "commence": "🚀",
-    "démarre": "🚀",
-    "vas": "🚀",
-    "amour": "❤️",
-    "coeur": "❤️",
-    "secret": "🤫",
-    "incroyable": "🤯"
-}
-
-def add_emoji_end(text):
-    t = text.lower()
-    for word, emoji in EMOJI_MAP.items():
-        if word in t:
-            return text + " " + emoji
-    return text
-
-# ===== Whisper (low RAM) =====
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
     device="cpu",
@@ -61,25 +19,30 @@ MODEL = WhisperModel(
     num_workers=1
 )
 
-# ===== ROUTES =====
+# Mots FR -> fichier PNG emoji (overlay)
+EMOJI_RULES = [
+    (["argent", "riche", "richesse", "million", "euro"], "money.png"),
+    (["succès", "réussir", "réussite", "gagner", "victoire"], "trophy.png"),
+    (["cerveau", "mental", "esprit", "penser", "réfléchir"], "brain.png"),
+    (["danger", "risque"], "warning.png"),
+    (["peur", "stress"], "warning.png"),
+    (["maintenant", "commence", "démarre", "vas", "go"], "rocket.png"),
+    (["amour", "coeur"], "heart.png"),
+    (["incroyable", "ouf", "dingue"], "fire.png"),
+]
 
 @app.get("/")
 def home():
     return {
-        "service": "ffmpeg-whisper-subtitles-api",
+        "service": "ffmpeg-whisper-subtitles-emoji-overlay",
         "status": "online",
         "model": WHISPER_MODEL_NAME,
-        "endpoints": {
-            "health": "/health",
-            "render": "/render"
-        }
+        "endpoints": {"health": "/health", "render": "/render"}
     }, 200
 
 @app.get("/health")
 def health():
     return "ok", 200
-
-# ===== UTILS =====
 
 def get_duration_seconds(path):
     p = subprocess.run([
@@ -91,21 +54,21 @@ def get_duration_seconds(path):
     return float(p.stdout.strip())
 
 def normalize(t):
-    return re.sub(r"\s+", " ", t).strip()
+    return re.sub(r"\s+", " ", (t or "")).strip()
 
 def split_cpl(text):
     text = normalize(text)
+    if not text:
+        return []
     words = text.split(" ")
-    out = []
-    cur = ""
-
+    out, cur = [], ""
     for w in words:
-        if len(cur) + len(w) + 1 <= MAX_CPL:
+        if len(cur) + len(w) + (1 if cur else 0) <= MAX_CPL:
             cur = (cur + " " + w).strip()
         else:
-            out.append(cur)
+            if cur:
+                out.append(cur)
             cur = w
-
     if cur:
         out.append(cur)
     return out
@@ -120,52 +83,68 @@ def srt_ts(sec):
     ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def make_srt(segments, out_path):
+def pick_emoji_file(text):
+    t = (text or "").lower()
+    for keywords, fname in EMOJI_RULES:
+        if any(k in t for k in keywords):
+            return fname
+    return None
+
+def make_srt_and_emoji_events(segments, srt_path):
+    """
+    Génère:
+    - SRT (texte sans emoji unicode)
+    - events emoji: [(start, end, emoji_file)]
+    """
     lines = []
+    events = []
     idx = 1
 
     for seg in segments:
         start = float(seg.start)
         end = float(seg.end)
-        text = add_emoji_end(seg.text)
-        parts = split_cpl(text)
+        raw = normalize(seg.text)
+        if not raw:
+            continue
 
+        emoji_file = pick_emoji_file(raw)
+        parts = split_cpl(raw)
         if not parts:
             continue
 
         dur = (end - start) / len(parts)
 
-        for i, p in enumerate(parts):
+        for i, ptxt in enumerate(parts):
             s = start + i * dur
-            e = min(s + MAX_DURATION, start + (i+1) * dur)
+            e = min(s + MAX_DURATION, start + (i + 1) * dur)
 
             lines.append(str(idx))
             lines.append(f"{srt_ts(s)} --> {srt_ts(e)}")
-            lines.append(p)
+            lines.append(ptxt)
             lines.append("")
             idx += 1
 
-    with open(out_path, "w", encoding="utf-8") as f:
+            # ✅ emoji seulement à la fin "de la phrase" => on l’affiche pendant CE sous-titre
+            if emoji_file:
+                events.append((s, e, emoji_file))
+
+    with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-# ===== MAIN RENDER =====
+    return events
 
 @app.post("/render")
 def render():
-
     if "video" not in request.files or "audio" not in request.files:
         return {"error": "Missing video or audio"}, 400
-
-    video = request.files["video"]
-    audio = request.files["audio"]
 
     vpath = f"/tmp/{uuid.uuid4()}.mp4"
     apath = f"/tmp/{uuid.uuid4()}.mp3"
     srt = f"/tmp/{uuid.uuid4()}.srt"
     out = f"/tmp/{uuid.uuid4()}.mp4"
 
-    video.save(vpath)
-    audio.save(apath)
+    request.files["video"].save(vpath)
+    request.files["audio"].save(apath)
 
     try:
         duration = get_duration_seconds(apath)
@@ -175,17 +154,47 @@ def render():
     try:
         segments, _ = MODEL.transcribe(apath, vad_filter=True)
         segments = list(segments)
-        make_srt(segments, srt)
+        emoji_events = make_srt_and_emoji_events(segments, srt)
     except Exception as e:
         return {"error": "Transcription failed", "details": str(e)}, 500
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", vpath,
-        "-i", apath,
+    # ---- FFmpeg: burn subtitles then overlay emojis (PNG) ----
+    # Inputs: 0=video, 1=audio, + one input per unique emoji PNG
+    unique_emojis = []
+    for _, _, f in emoji_events:
+        if f not in unique_emojis:
+            unique_emojis.append(f)
+
+    ffmpeg_cmd = ["ffmpeg", "-y", "-i", vpath, "-i", apath]
+    for f in unique_emojis:
+        ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
+
+    # Base: subtitles on video
+    force_style = "FontName=DejaVu Sans,FontSize=14,Outline=2,Shadow=1,MarginV=90"
+    filter_steps = []
+    filter_steps.append(f"[0:v]subtitles={srt}:force_style='{force_style}'[v0]")
+
+    # Overlay each event
+    current = "v0"
+    # position emoji: bottom-right-ish (tweak if you want)
+    # scale to 48px width
+    for idx_ev, (s, e, fname) in enumerate(emoji_events):
+        inp_index = 2 + unique_emojis.index(fname)  # video=0, audio=1
+        next_v = f"v{idx_ev+1}"
+        filter_steps.append(
+            f"[{inp_index}:v]scale=48:-1[em{idx_ev}]"
+        )
+        filter_steps.append(
+            f"[{current}][em{idx_ev}]overlay=x=W-w-40:y=H-h-140:enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
+        )
+        current = next_v
+
+    filter_complex = ";".join(filter_steps)
+
+    ffmpeg_cmd += [
         "-t", str(duration),
-        "-vf", f"subtitles={srt}:force_style='FontName=Noto Emoji,FontSize=14,Outline=2,Shadow=1,MarginV=90'",
-        "-map", "0:v:0",
+        "-filter_complex", filter_complex,
+        "-map", f"[{current}]",
         "-map", "1:a:0",
         "-c:v", "libx264",
         "-preset", "ultrafast",
@@ -196,15 +205,11 @@ def render():
         out
     ]
 
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
+    p = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
         return {"error": "ffmpeg failed", "stderr": p.stderr[-2000:]}, 500
 
     return send_file(out, mimetype="video/mp4")
 
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
-
