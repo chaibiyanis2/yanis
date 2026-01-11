@@ -1,14 +1,13 @@
 FROM python:3.11-slim
 
-# FFmpeg + ffprobe + support sous-titres + polices
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     ffmpeg \
     fonts-dejavu \
+    fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Python deps
 RUN pip install --no-cache-dir flask faster-whisper
 
 COPY app.py /app/app.py
