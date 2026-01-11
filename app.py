@@ -12,7 +12,47 @@ WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
 MAX_CPL = 14
 MAX_DURATION = 2.0
 
-# Whisper low-RAM
+# ===== EMOJIS FR =====
+EMOJI_MAP = {
+    "argent": "💰",
+    "riche": "💰",
+    "richesse": "💰",
+    "million": "💰",
+    "business": "📈",
+    "succès": "🏆",
+    "réussir": "🏆",
+    "réussite": "🏆",
+    "gagner": "🏆",
+    "temps": "⏳",
+    "vie": "⏳",
+    "jour": "📅",
+    "cerveau": "🧠",
+    "mental": "🧠",
+    "esprit": "🧠",
+    "discipline": "💪",
+    "travaille": "💪",
+    "fort": "💪",
+    "peur": "😨",
+    "stress": "😰",
+    "danger": "🔥",
+    "maintenant": "🚀",
+    "commence": "🚀",
+    "démarre": "🚀",
+    "vas": "🚀",
+    "amour": "❤️",
+    "coeur": "❤️",
+    "secret": "🤫",
+    "incroyable": "🤯"
+}
+
+def add_emoji_end(text):
+    t = text.lower()
+    for word, emoji in EMOJI_MAP.items():
+        if word in t:
+            return text + " " + emoji
+    return text
+
+# ===== Whisper (low RAM) =====
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
     device="cpu",
@@ -39,7 +79,6 @@ def home():
 def health():
     return "ok", 200
 
-
 # ===== UTILS =====
 
 def get_duration_seconds(path):
@@ -49,13 +88,10 @@ def get_duration_seconds(path):
         "-of", "default=noprint_wrappers=1:nokey=1",
         path
     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
     return float(p.stdout.strip())
-
 
 def normalize(t):
     return re.sub(r"\s+", " ", t).strip()
-
 
 def split_cpl(text):
     text = normalize(text)
@@ -74,7 +110,6 @@ def split_cpl(text):
         out.append(cur)
     return out
 
-
 def srt_ts(sec):
     ms = int(sec * 1000)
     h = ms // 3600000
@@ -85,7 +120,6 @@ def srt_ts(sec):
     ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-
 def make_srt(segments, out_path):
     lines = []
     idx = 1
@@ -93,7 +127,8 @@ def make_srt(segments, out_path):
     for seg in segments:
         start = float(seg.start)
         end = float(seg.end)
-        parts = split_cpl(seg.text)
+        text = add_emoji_end(seg.text)
+        parts = split_cpl(text)
 
         if not parts:
             continue
@@ -112,7 +147,6 @@ def make_srt(segments, out_path):
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-
 
 # ===== MAIN RENDER =====
 
@@ -133,13 +167,11 @@ def render():
     video.save(vpath)
     audio.save(apath)
 
-    # Audio duration
     try:
         duration = get_duration_seconds(apath)
     except:
         return {"error": "Cannot read audio duration"}, 500
 
-    # Whisper
     try:
         segments, _ = MODEL.transcribe(apath, vad_filter=True)
         segments = list(segments)
@@ -147,7 +179,6 @@ def render():
     except Exception as e:
         return {"error": "Transcription failed", "details": str(e)}, 500
 
-    # FFmpeg render
     cmd = [
         "ffmpeg", "-y",
         "-i", vpath,
