@@ -13,14 +13,18 @@ app = Flask(__name__)
 # =========================
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
 
-MAX_CPL = 14            # max chars per subtitle line
-CAP_DUR = 0.5           # ✅ 500ms
+MAX_CPL = 14            # max characters per subtitle line
+CAP_DUR = 0.5           # ✅ 500ms per caption block
 FONT_SIZE = 14
 MARGIN_V = 90
 
-EMOJI_SIZE = 44         # emoji png size
-EMOJI_RAISE_PX = 40     # emoji higher than subtitle
-EMOJI_GAP_PX = 10       # space between text and emoji
+EMOJI_SIZE = 44         # emoji PNG size (px)
+EMOJI_RAISE_PX = 40     # emoji higher than subtitle baseline
+EMOJI_GAP_PX = 10       # horizontal gap between text and emoji
+
+# Emoji display behavior
+EMOJI_COOLDOWN = 0.8    # seconds: prevents spam of same emoji too often
+EMOJI_MAX_DUR = 0.5     # seconds: cap emoji display duration (<= caption duration)
 
 # Whisper low-RAM (Render Free friendly)
 MODEL = WhisperModel(
@@ -32,7 +36,7 @@ MODEL = WhisperModel(
 )
 
 # =========================
-# EMOJI RULES (FR, accent-insensitive) -> PNG
+# EMOJI RULES (FR, accent-insensitive) -> PNG filenames
 # =========================
 EMOJI_RULES = [
     (["argent", "riche", "richesse", "million", "euros", "euro", "cash", "fortune"], "money.png"),
@@ -45,7 +49,7 @@ EMOJI_RULES = [
 ]
 
 # =========================
-# TEXT NORMALIZATION (fix d 'etre -> d'être)
+# TEXT NORMALIZATION (fix d 'etre -> d'etre)
 # =========================
 APOS = "'"
 
@@ -61,21 +65,16 @@ def norm_key(s: str) -> str:
 
 def normalize_text(s: str) -> str:
     """
-    - Normalise espaces
-    - Fix espaces avant apostrophe: "d 'etre" -> "d'etre"
-    - Fix espaces avant ponctuation: "toi !" -> "toi!"
-    - Replace apostrophe courbe -> '
+    - Normalize whitespace
+    - Fix spaces around apostrophes: "d 'etre" -> "d'etre"
+    - Fix spaces before punctuation: "toi !" -> "toi!"
+    - Normalize curly apostrophe to '
     """
     s = s or ""
     s = s.replace("’", APOS)
     s = re.sub(r"\s+", " ", s).strip()
-
-    # remove spaces around apostrophes: "d 'etre" / "d’ etre" / "d ’ etre"
     s = re.sub(r"\s*'\s*", "'", s)
-
-    # remove space before punctuation
     s = re.sub(r"\s+([,.;:!?])", r"\1", s)
-
     return s
 
 # =========================
@@ -89,7 +88,7 @@ def home():
         "model": WHISPER_MODEL_NAME,
         "endpoints": {"health": "/health", "render": "/render"},
         "subtitle": {"cap_dur_ms": int(CAP_DUR * 1000), "max_cpl": MAX_CPL},
-        "emoji": {"size": EMOJI_SIZE, "raise_px": EMOJI_RAISE_PX}
+        "emoji": {"size": EMOJI_SIZE, "raise_px": EMOJI_RAISE_PX, "cooldown_s": EMOJI_COOLDOWN}
     }, 200
 
 @app.get("/health")
@@ -120,14 +119,42 @@ def srt_ts(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 # =========================
-# EMOJI PICKER
+# EMOJI PICKERS
 # =========================
-def pick_emoji_file(text: str):
+def pick_emoji_for_text(text: str):
     t = norm_key(text)
     for keywords, fname in EMOJI_RULES:
         if any(k in t for k in keywords):
             return fname
     return None
+
+def make_emoji_events_from_captions(captions):
+    """
+    ✅ Emoji appears when the keyword appears in the caption text.
+    ✅ Prevents spam: no same emoji too often (cooldown).
+    ✅ Output: [(s, e, emoji_file, caption_text)]
+    """
+    events = []
+    last_emoji = None
+    last_time = -999.0
+
+    for (s, e, text) in captions:
+        emoji = pick_emoji_for_text(text)
+        if not emoji:
+            continue
+
+        # cap emoji duration
+        e2 = min(e, s + EMOJI_MAX_DUR)
+
+        # anti-spam
+        if emoji == last_emoji and (s - last_time) < EMOJI_COOLDOWN:
+            continue
+
+        events.append((s, e2, emoji, text))
+        last_emoji = emoji
+        last_time = s
+
+    return events
 
 # =========================
 # SUBTITLE BUILDERS (word timestamps)
@@ -158,7 +185,8 @@ def split_cpl_words(words, max_cpl: int):
 
 def build_captions_from_words(all_words):
     """
-    ✅ 500ms blocks based on word timestamps (precise)
+    ✅ Builds captions using word timestamps.
+    ✅ Each block spans up to CAP_DUR (0.5s).
     returns: list of (s, e, text)
     """
     captions = []
@@ -169,19 +197,16 @@ def build_captions_from_words(all_words):
         start = all_words[i]["s"]
         end_limit = start + CAP_DUR
 
-        # collect words that end within the 500ms window
         j = i
         chunk = []
         while j < n and all_words[j]["e"] <= end_limit:
             chunk.append(all_words[j])
             j += 1
 
-        # if none fit, force 1 word
         if not chunk:
             chunk = [all_words[i]]
             j = i + 1
 
-        # group by CPL
         subgroups = split_cpl_words(chunk, MAX_CPL)
 
         block_start = chunk[0]["s"]
@@ -214,20 +239,6 @@ def write_srt(captions, srt_path: str):
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-def make_emoji_events(captions, full_text: str):
-    """
-    ✅ Emoji:
-    - one time only
-    - shown exactly on the LAST caption time window
-    - positioned next to last caption text (best visual match)
-    """
-    emoji_file = pick_emoji_file(full_text)
-    if not emoji_file or not captions:
-        return []
-
-    s, e, last_text = captions[-1]
-    return [(s, e, emoji_file, last_text)]
-
 # =========================
 # MAIN
 # =========================
@@ -259,19 +270,12 @@ def render():
         )
 
         all_words = []
-        full_text_parts = []
-
         for seg in segments:
-            if seg.text:
-                full_text_parts.append(seg.text)
-
             if getattr(seg, "words", None):
                 for w in seg.words:
                     ww = normalize_text(w.word)
                     if ww:
                         all_words.append({"w": ww, "s": float(w.start), "e": float(w.end)})
-
-        full_text = normalize_text(" ".join(full_text_parts))
 
         if not all_words:
             return {"error": "No words extracted from transcription"}, 500
@@ -279,7 +283,8 @@ def render():
         captions = build_captions_from_words(all_words)
         write_srt(captions, srt_path)
 
-        emoji_events = make_emoji_events(captions, full_text)
+        # ✅ emoji timing based on caption text
+        emoji_events = make_emoji_events_from_captions(captions)
 
     except Exception as e:
         return {"error": "Transcription failed", "details": str(e)}, 500
@@ -307,10 +312,11 @@ def render():
 
         filter_steps.append(f"[{inp_index}:v]scale={EMOJI_SIZE}:-1[em{idx_ev}]")
 
+        # place next to centered caption text
         half_w = estimate_text_half_width_px(shown_text)
         x_px = half_w + EMOJI_GAP_PX
 
-        # ✅ emoji next to centered text, and higher than the subtitle
+        # higher than subtitle
         y_expr = f"H-h-{MARGIN_V + EMOJI_RAISE_PX}"
 
         filter_steps.append(
