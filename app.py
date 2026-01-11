@@ -3,6 +3,7 @@ import subprocess
 import uuid
 import os
 import re
+import unicodedata
 from faster_whisper import WhisperModel
 
 app = Flask(__name__)
@@ -21,15 +22,39 @@ MODEL = WhisperModel(
 
 # Mots FR -> fichier PNG emoji (overlay)
 EMOJI_RULES = [
-    (["argent", "riche", "richesse", "million", "euro"], "money.png"),
-    (["succès", "réussir", "réussite", "gagner", "victoire"], "trophy.png"),
-    (["cerveau", "mental", "esprit", "penser", "réfléchir"], "brain.png"),
-    (["danger", "risque"], "warning.png"),
-    (["peur", "stress"], "warning.png"),
-    (["maintenant", "commence", "démarre", "vas", "go"], "rocket.png"),
+    # 💰 argent
+    (["argent", "riche", "richesse", "million", "euros", "euro", "cash", "fortune"], "money.png"),
+
+    # 🏆 réussite
+    (["succes", "reussir", "reussite", "gagner", "victoire", "recompense"], "trophy.png"),
+
+    # 🧠 mental
+    (["cerveau", "mental", "esprit", "mindset", "penser", "reflechir"], "brain.png"),
+
+    # 💪 action / travail
+    (["travail", "travaille", "travailler", "effort", "discipline", "constance", "persiste", "persister"], "fire.png"),
+
+    # ⏳ temps / vie
+    (["temps", "minute", "jour", "jours", "vie"], "rocket.png"),
+
+    # ⚠️ blocage / echec / probleme
+    (["bloque", "blocage", "echec", "echouer", "probleme", "risque", "danger"], "warning.png"),
+
+    # ❤️ émotion
     (["amour", "coeur"], "heart.png"),
-    (["incroyable", "ouf", "dingue"], "fire.png"),
 ]
+
+
+def strip_accents(s: str) -> str:
+    s = s or ""
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s
+
+def norm_key(s: str) -> str:
+    s = strip_accents(s).lower()
+    s = s.replace("’", "'")  # apostrophe “courbe” -> normale
+    return s
 
 @app.get("/")
 def home():
@@ -83,8 +108,8 @@ def srt_ts(sec):
     ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def pick_emoji_file(text):
-    t = (text or "").lower()
+def pick_emoji_file(text: str):
+    t = norm_key(text)
     for keywords, fname in EMOJI_RULES:
         if any(k in t for k in keywords):
             return fname
@@ -213,3 +238,4 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
