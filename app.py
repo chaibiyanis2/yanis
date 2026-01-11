@@ -14,7 +14,7 @@ app = Flask(__name__)
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
 
 MAX_CPL = 14            # max characters per subtitle line
-CAP_DUR = 0.5           # ✅ 500ms per caption block
+CAP_DUR = 0.5           # 500ms per caption block
 FONT_SIZE = 14
 MARGIN_V = 90
 
@@ -23,10 +23,11 @@ EMOJI_SIZE = 44         # emoji PNG size (px)
 # Emoji display behavior
 EMOJI_MAX_DUR = 0.5     # seconds: cap emoji display duration (<= caption duration)
 
-# NEW: if audio is longer than video, slow video toward 16s, then CUT output to audio length (no silence)
-TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER = 16.0
+# ✅ Audio mix volumes (video sound + added audio)
+VIDEO_VOL = 1.0
+ADDED_AUDIO_VOL = 1.0
 
-# Whisper low-RAM (Render Free friendly)
+# Whisper low-RAM
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
     device="cpu",
@@ -37,7 +38,7 @@ MODEL = WhisperModel(
 
 # =========================
 # EMOJI RULES (FR, accent-insensitive) -> PNG filenames
-# One type = one emoji file
+# One rule = one "type" (one emoji file)
 # =========================
 EMOJI_RULES = [
     (["argent", "riche", "richesse", "million", "euros", "euro", "cash", "fortune"], "money.png"),
@@ -65,12 +66,6 @@ def norm_key(s: str) -> str:
     return s
 
 def normalize_text(s: str) -> str:
-    """
-    - Normalize whitespace
-    - Fix spaces around apostrophes: "d 'etre" -> "d'etre"
-    - Fix spaces before punctuation: "toi !" -> "toi!"
-    - Normalize curly apostrophe to '
-    """
     s = s or ""
     s = s.replace("’", APOS)
     s = re.sub(r"\s+", " ", s).strip()
@@ -89,15 +84,8 @@ def home():
         "model": WHISPER_MODEL_NAME,
         "endpoints": {"health": "/health", "render": "/render"},
         "subtitle": {"cap_dur_ms": int(CAP_DUR * 1000), "max_cpl": MAX_CPL},
-        "emoji": {
-            "size": EMOJI_SIZE,
-            "max_dur_s": EMOJI_MAX_DUR,
-            "position": "center_exact",
-            "policy": "one_per_type_per_video"
-        },
-        "video_speed": {
-            "if_audio_longer_than_video": "slow_video_then_cut_to_audio_end (no_silence)"
-        }
+        "emoji": {"size": EMOJI_SIZE, "max_dur_s": EMOJI_MAX_DUR, "position": "center_exact"},
+        "audio": {"mode": "mix_video_audio_plus_added_audio", "video_vol": VIDEO_VOL, "added_vol": ADDED_AUDIO_VOL}
     }, 200
 
 @app.get("/health")
@@ -116,6 +104,15 @@ def get_duration_seconds(path: str) -> float:
     if p.returncode != 0 or not p.stdout.strip():
         raise RuntimeError(p.stderr.strip() or "ffprobe failed")
     return float(p.stdout.strip())
+
+def video_has_audio(path: str) -> bool:
+    p = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=index",
+         "-of", "csv=p=0", path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    return p.returncode == 0 and bool(p.stdout.strip())
 
 def srt_ts(sec: float) -> str:
     ms = int(sec * 1000)
@@ -141,7 +138,6 @@ def make_emoji_events_from_captions(captions):
     """
     ✅ Emoji appears when the keyword appears in the caption text.
     ✅ Only ONE occurrence per emoji type for the whole video.
-    ✅ Output: [(s, e, emoji_file, caption_text)]
     """
     events = []
     used_types = set()
@@ -150,7 +146,6 @@ def make_emoji_events_from_captions(captions):
         emoji = pick_emoji_for_text(text)
         if not emoji:
             continue
-
         if emoji in used_types:
             continue
 
@@ -245,21 +240,11 @@ def render():
     request.files["video"].save(vpath)
     request.files["audio"].save(apath)
 
-    # durations
+    # duration = audio duration (kept as before)
     try:
-        audio_duration = get_duration_seconds(apath)
-        video_duration = get_duration_seconds(vpath)
+        duration = get_duration_seconds(apath)
     except Exception as e:
-        return {"error": "Cannot read media duration", "details": str(e)}, 500
-
-    # If audio longer than video -> slow video (toward 16s), but FINAL output ends with audio (no silence)
-    slow_mode = (audio_duration > video_duration and video_duration > 0.05)
-
-    # FINAL output duration: always ends with audio (and if slow_mode, cannot exceed slowed video length = 16s)
-    if slow_mode:
-        target_out_duration = min(audio_duration, TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER)
-    else:
-        target_out_duration = audio_duration
+        return {"error": "Cannot read audio duration", "details": str(e)}, 500
 
     # Whisper with word timestamps
     try:
@@ -282,6 +267,7 @@ def render():
 
         captions = build_captions_from_words(all_words)
         write_srt(captions, srt_path)
+
         emoji_events = make_emoji_events_from_captions(captions)
 
     except Exception as e:
@@ -301,17 +287,11 @@ def render():
 
     filter_steps = []
 
-    # If slow_mode: slow the video so it reaches 16s (timeline becomes longer), then apply subtitles
-    if slow_mode:
-        speed_factor = TARGET_VIDEO_SECONDS_WHEN_AUDIO_LONGER / video_duration  # >1 => slow
-        filter_steps.append(f"[0:v]setpts=PTS*{speed_factor:.8f}[vpre]")
-        filter_steps.append(f"[vpre]subtitles={srt_path}:force_style='{force_style}'[v0]")
-    else:
-        filter_steps.append(f"[0:v]subtitles={srt_path}:force_style='{force_style}'[v0]")
-
+    # Video + subtitles
+    filter_steps.append(f"[0:v]subtitles={srt_path}:force_style='{force_style}'[v0]")
     current = "v0"
 
-    # Emoji centered in video
+    # Emoji overlays at exact center
     x_center = "(W-w)/2"
     y_center = "(H-h)/2"
 
@@ -327,25 +307,37 @@ def render():
         )
         current = next_v
 
-    # ✅ CUT VIDEO to audio end (no silence)
-    filter_steps.append(f"[{current}]trim=0:{target_out_duration:.3f},setpts=PTS-STARTPTS[vout]")
-
-    # ✅ CUT AUDIO to same end
-    filter_steps.append(f"[1:a]atrim=0:{target_out_duration:.3f},asetpts=PTS-STARTPTS[a0]")
+    # ✅ Audio: keep video audio AND add provided audio (mix)
+    has_vid_audio = video_has_audio(vpath)
+    if has_vid_audio:
+        filter_steps.append(
+            f"[0:a]volume={VIDEO_VOL},aresample=async=1:first_pts=0[a0]"
+        )
+        filter_steps.append(
+            f"[1:a]volume={ADDED_AUDIO_VOL},aresample=async=1:first_pts=0[a1]"
+        )
+        filter_steps.append(
+            "[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
+        )
+        audio_map = "[aout]"
+    else:
+        # fallback: if the video has no audio, just use added audio
+        filter_steps.append(f"[1:a]volume={ADDED_AUDIO_VOL},aresample=async=1:first_pts=0[aout]")
+        audio_map = "[aout]"
 
     filter_complex = ";".join(filter_steps)
 
     ffmpeg_cmd += [
-        "-t", f"{target_out_duration:.3f}",
+        "-t", str(duration),
         "-filter_complex", filter_complex,
-        "-map", "[vout]",
-        "-map", "[a0]",
+        "-map", f"[{current}]",
+        "-map", audio_map,
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "32",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "192k",
         "-movflags", "+faststart",
         out
     ]
