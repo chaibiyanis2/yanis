@@ -5,7 +5,6 @@ import os
 
 app = Flask(__name__)
 
-# ✅ Page d'accueil (évite les 404 sur "/")
 @app.get("/")
 def home():
     return {
@@ -17,10 +16,26 @@ def home():
         }
     }, 200
 
-
 @app.get("/health")
 def health():
     return "ok", 200
+
+
+def get_audio_duration_seconds(audio_path: str) -> float:
+    """
+    Retourne la durée réelle (en secondes) via ffprobe.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        audio_path
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0 or not p.stdout.strip():
+        raise RuntimeError(f"ffprobe failed: {p.stderr}")
+    return float(p.stdout.strip())
 
 
 @app.post("/render")
@@ -38,22 +53,35 @@ def render():
     video.save(video_path)
     audio.save(audio_path)
 
-    cmd = [
-    "ffmpeg", "-y",
-    "-i", video_path,
-    "-i", audio_path,
-    "-map", "0:v:0",
-    "-map", "1:a:0",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-shortest",
-    "-movflags", "+faststart",
-    output_path
-]
+    try:
+        audio_duration = get_audio_duration_seconds(audio_path)
+    except Exception as e:
+        return {"error": "Could not read audio duration", "details": str(e)}, 500
 
+    # Petite marge pour éviter les coupes à cause des arrondis/metadata
+    audio_duration = max(0.1, audio_duration + 0.05)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+
+        # ✅ on force la durée = durée réelle de l'audio
+        "-t", f"{audio_duration}",
+
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
+
+        "-c:a", "aac",
+        "-b:a", "128k",
+
+        "-movflags", "+faststart",
+        output_path
+    ]
 
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -61,7 +89,7 @@ def render():
         return {
             "error": "ffmpeg failed",
             "returncode": p.returncode,
-            "stderr": p.stderr[-2000:]
+            "stderr": p.stderr[-2500:]
         }, 500
 
     return send_file(output_path, mimetype="video/mp4")
@@ -69,4 +97,3 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
