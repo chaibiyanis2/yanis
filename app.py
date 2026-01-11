@@ -243,7 +243,7 @@ def render():
     try:
         vdur = get_duration_seconds(vpath)
         adur = get_duration_seconds(apath)
-        out_dur = max(vdur, adur)
+        out_dur = adur
     except Exception as e:
         return {"error": "Cannot read media duration", "details": str(e)}, 500
 
@@ -348,3 +348,4 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
