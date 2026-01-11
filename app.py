@@ -100,17 +100,23 @@ def render():
     except Exception as e:
         return {"error": "Could not read audio duration", "details": str(e)}, 500
 
-    # Transcription Whisper -> segments -> SRT
-    try:
-        segments, info = MODEL.transcribe(
-            audio_path,
-            vad_filter=True,
-            word_timestamps=False
-        )
-        segments = list(segments)
-        write_srt(segments, srt_path)
-    except Exception as e:
-        return {"error": "Transcription failed", "details": str(e)}, 500
+   # Transcription Whisper -> segments -> SRT (version low-RAM, stable)
+try:
+    segments, info = MODEL.transcribe(
+        audio_path,
+        vad_filter=True,
+        word_timestamps=False
+    )
+
+    # On force la génération maintenant (mais on ne garde rien d'autre en mémoire)
+    segments = list(segments)
+
+    # On écrit le SRT optimisé (CPL, 1 ligne, 2s max)
+    make_srt_from_whisper_segments(segments, srt_path)
+
+except Exception as e:
+    return {"error": "Transcription failed", "details": str(e)}, 500
+
 
     # Petite marge anti-arrondi
     audio_duration = max(0.1, audio_duration + 0.05)
@@ -131,8 +137,9 @@ def render():
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", "ultrafast",
         "-pix_fmt", "yuv420p",
+        "-crf", "32",
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
@@ -153,5 +160,6 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
