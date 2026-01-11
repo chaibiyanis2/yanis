@@ -11,9 +11,12 @@ app = Flask(__name__)
 # ===== CONFIG =====
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
 MAX_CPL = 14
-MAX_DURATION = 0.5  # ✅ 500ms par sous-titre
+SUB_MS = 500
+SUB_DUR = SUB_MS / 1000.0  # ✅ 0.5s fixes
 
-# Whisper low-RAM (Render Free friendly)
+FONT_SIZE = 14
+MARGIN_V = 90
+
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
     device="cpu",
@@ -111,14 +114,24 @@ def pick_emoji_file(text: str):
             return fname
     return None
 
+def estimate_text_half_width_px(text: str) -> int:
+    """
+    Estimation simple de la moitié de la largeur du texte (en px).
+    On approx: 0.55 * FONT_SIZE par caractère.
+    """
+    n = len(text)
+    return int((n * FONT_SIZE * 0.55) / 2)
+
 def make_srt_and_emoji_events(segments, srt_path: str):
     """
-    ✅ SRT: 1 ligne, max 14 caractères, durée fixe 500ms
-    ✅ Emoji: overlay PNG pendant 500ms, à côté du texte
+    ✅ Sous-titres 500ms fixes
+    ✅ Emoji non répété: seulement sur le DERNIER sous-titre du segment
+    ✅ Emoji position calculée pour être à côté du texte centré
     """
     lines = []
     events = []
     idx = 1
+    last_emoji = None  # pour éviter répétition "emoji emoji"
 
     for seg in segments:
         start = float(seg.start)
@@ -127,17 +140,17 @@ def make_srt_and_emoji_events(segments, srt_path: str):
         if not raw:
             continue
 
-        emoji_file = pick_emoji_file(raw)
         parts = split_cpl(raw)
         if not parts:
             continue
 
-        t = start
-        for ptxt in parts:
-            s = t
-            e = min(s + MAX_DURATION, end)
+        emoji_file = pick_emoji_file(raw)
 
-            # stop si on dépasse le segment
+        # 🔥 500ms fixes: on enchaîne les parts toutes les 0.5s
+        t = start
+        for i, ptxt in enumerate(parts):
+            s = t
+            e = min(s + SUB_DUR, end)
             if e <= s:
                 break
 
@@ -146,11 +159,14 @@ def make_srt_and_emoji_events(segments, srt_path: str):
             lines.append(ptxt)
             lines.append("")
             idx += 1
+            t = e
 
-            if emoji_file:
-                events.append((s, e, emoji_file))
-
-            t = e  # avance bloc par bloc (500ms)
+            # ✅ Emoji seulement sur le dernier morceau du segment
+            if i == len(parts) - 1 and emoji_file:
+                # ✅ pas d’emoji répété deux fois de suite
+                if emoji_file != last_emoji:
+                    events.append((s, e, emoji_file, ptxt))  # on garde aussi le texte
+                    last_emoji = emoji_file
 
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -184,7 +200,7 @@ def render():
 
     # ---- FFmpeg: burn subtitles then overlay emojis (PNG) ----
     unique_emojis = []
-    for _, _, f in emoji_events:
+    for _, _, f, _ in emoji_events:
         if f not in unique_emojis:
             unique_emojis.append(f)
 
@@ -192,26 +208,29 @@ def render():
     for f in unique_emojis:
         ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
 
-    # Subtitle style (texte petit)
-    force_style = "FontName=DejaVu Sans,FontSize=14,Outline=2,Shadow=1,MarginV=90"
+    force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
     filter_steps = []
     filter_steps.append(f"[0:v]subtitles={srt}:force_style='{force_style}'[v0]")
 
-    # Emoji à côté du texte (à droite, même hauteur)
     current = "v0"
-    for idx_ev, (s, e, fname) in enumerate(emoji_events):
-        inp_index = 2 + unique_emojis.index(fname)  # 0=video,1=audio,2+=png inputs
+
+    for idx_ev, (s, e, fname, shown_text) in enumerate(emoji_events):
+        inp_index = 2 + unique_emojis.index(fname)
         next_v = f"v{idx_ev+1}"
 
         # taille emoji
         filter_steps.append(f"[{inp_index}:v]scale=44:-1[em{idx_ev}]")
 
-        # position: à droite du centre, aligné verticalement avec sous-titre
-        # ajuste +160 / +220 si tu veux plus proche/loin
+        # ✅ Position: à côté du texte centré
+        # Texte est centré -> son bord droit approx = W/2 + half_width
+        half_w = estimate_text_half_width_px(shown_text)
+        x_px = half_w + 18  # 18px d’espace entre texte et emoji
+
+        # y aligné sur la même zone que les sous-titres (bas)
         filter_steps.append(
             f"[{current}][em{idx_ev}]overlay="
-            f"x=(W/2)+190:y=H-h-95:"
+            f"x=(W/2)+{x_px}:y=H-h-{MARGIN_V + 5}:"
             f"enable='between(t,{s:.3f},{e:.3f})'[{next_v}]"
         )
         current = next_v
