@@ -1,13 +1,20 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    fontconfig \
     fonts-dejavu \
-    fonts-noto-color-emoji \
+    ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Télécharger une police emoji MONOCHROME (compatible libass)
+RUN mkdir -p /usr/local/share/fonts && \
+    curl -L -o /usr/local/share/fonts/NotoEmoji-Regular.ttf \
+    https://raw.githubusercontent.com/googlefonts/noto-emoji/main/fonts/NotoEmoji-Regular.ttf && \
+    fc-cache -f -v
 
+WORKDIR /app
 RUN pip install --no-cache-dir flask faster-whisper
 
 COPY app.py /app/app.py
