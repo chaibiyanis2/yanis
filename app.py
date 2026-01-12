@@ -25,6 +25,7 @@ EMOJI_MAX_DUR = 0.5
 VIDEO_VOL = 1.0
 ADDED_AUDIO_VOL = 1.0
 
+# MICRO progressive zoom (whole video)
 ZOOM_START = 1.00
 ZOOM_END = 1.03   # or 1.025
 ZOOM_FPS = 30
@@ -37,6 +38,9 @@ MODEL = WhisperModel(
     num_workers=1
 )
 
+# =========================
+# EMOJI RULES
+# =========================
 EMOJI_RULES = [
     (["argent", "riche", "richesse", "million", "euros", "euro", "cash", "fortune"], "money.png"),
     (["succes", "reussir", "reussite", "gagner", "victoire", "recompense"], "trophy.png"),
@@ -47,6 +51,9 @@ EMOJI_RULES = [
     (["amour", "coeur"], "heart.png"),
 ]
 
+# =========================
+# TEXT NORMALIZATION
+# =========================
 APOS = "'"
 
 def strip_accents(s: str) -> str:
@@ -67,10 +74,16 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\s+([,.;:!?])", r"\1", s)
     return s
 
+# =========================
+# ROUTES
+# =========================
 @app.get("/health")
 def health():
     return "ok", 200
 
+# =========================
+# MEDIA UTILS
+# =========================
 def get_duration_seconds(path: str) -> float:
     p = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -81,39 +94,49 @@ def get_duration_seconds(path: str) -> float:
         raise RuntimeError((p.stderr or "").strip() or "ffprobe duration failed")
     return float(p.stdout.strip())
 
-def get_video_size(path: str):
-    # Try default output: width\nheight\n
-    p1 = subprocess.run(
+def get_video_stream_info(path: str):
+    """
+    Returns dict with width, height, rotation_degrees (0/90/180/270 if found).
+    Robust: json output.
+    """
+    p = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height",
-         "-of", "default=noprint_wrappers=1:nokey=1", path],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    out1 = (p1.stdout or "").strip().splitlines()
-    if p1.returncode == 0 and len(out1) >= 2:
-        w = int(out1[0].strip())
-        h = int(out1[1].strip())
-        if w > 0 and h > 0:
-            return w, h
-
-    # Fallback json
-    p2 = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height",
+         "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data",
          "-of", "json", path],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    out2 = (p2.stdout or "").strip()
-    if p2.returncode == 0 and out2:
-        data = json.loads(out2)
-        streams = data.get("streams") or []
-        if streams:
-            w = int(streams[0].get("width") or 0)
-            h = int(streams[0].get("height") or 0)
-            if w > 0 and h > 0:
-                return w, h
+    if p.returncode != 0 or not (p.stdout or "").strip():
+        raise RuntimeError((p.stderr or "").strip() or "ffprobe stream info failed")
 
-    raise RuntimeError("ffprobe size failed")
+    data = json.loads(p.stdout)
+    streams = data.get("streams") or []
+    if not streams:
+        raise RuntimeError("ffprobe returned no video streams")
+
+    st = streams[0]
+    w = int(st.get("width") or 0)
+    h = int(st.get("height") or 0)
+
+    rot = 0
+    tags = st.get("tags") or {}
+    if "rotate" in tags:
+        try:
+            rot = int(tags["rotate"]) % 360
+        except Exception:
+            rot = 0
+
+    # Some ffprobe builds store rotation in side_data_list
+    sdl = st.get("side_data_list") or []
+    for sd in sdl:
+        # rotation might appear as "rotation": -90.0 or similar
+        if "rotation" in sd:
+            try:
+                rr = int(round(float(sd["rotation"]))) % 360
+                rot = rr
+            except Exception:
+                pass
+
+    return {"w": w, "h": h, "rot": rot}
 
 def video_has_audio(path: str) -> bool:
     p = subprocess.run(
@@ -134,6 +157,9 @@ def srt_ts(sec: float) -> str:
     ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
+# =========================
+# EMOJI PICKERS
+# =========================
 def pick_emoji_for_text(text: str):
     t = norm_key(text)
     for keywords, fname in EMOJI_RULES:
@@ -142,6 +168,7 @@ def pick_emoji_for_text(text: str):
     return None
 
 def make_emoji_events_from_captions(captions):
+    # Only ONE occurrence per emoji type for whole video
     events = []
     used_types = set()
     for (s, e, text) in captions:
@@ -155,6 +182,9 @@ def make_emoji_events_from_captions(captions):
         used_types.add(emoji)
     return events
 
+# =========================
+# SUBTITLE BUILDERS
+# =========================
 def split_cpl_words(words, max_cpl: int):
     groups = []
     cur = []
@@ -219,6 +249,9 @@ def write_srt(captions, srt_path: str):
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
+# =========================
+# MAIN
+# =========================
 @app.post("/render")
 def render():
     if "video" not in request.files or "audio" not in request.files:
@@ -232,24 +265,36 @@ def render():
     request.files["video"].save(vpath)
     request.files["audio"].save(apath)
 
-    # output ends when mp3 ends
+    # Output ends when MP3 ends
     try:
         out_dur = get_duration_seconds(apath)
     except Exception as e:
         return {"error": "Cannot read mp3 duration", "details": str(e)}, 500
 
-    # ✅ Always use real input size to keep orientation
+    # ✅ Read real video width/height + rotation metadata
     try:
-        vw, vh = get_video_size(vpath)
-        size_ok = True
-    except Exception:
-        size_ok = False
-        vw, vh = None, None
+        info = get_video_stream_info(vpath)
+        vw, vh, rot = info["w"], info["h"], info["rot"]
+        if vw <= 0 or vh <= 0:
+            raise RuntimeError("Invalid video width/height from ffprobe")
+    except Exception as e:
+        return {"error": "Cannot read video info", "details": str(e)}, 500
+
+    # If rotation is 90/270, displayed orientation is swapped
+    disp_w, disp_h = vw, vh
+    transpose_filter = None
+
+    if rot in (90, 270, -90):
+        disp_w, disp_h = vh, vw  # swap for displayed
+        # rot=90 means clockwise 90 -> transpose=1
+        # rot=270 means counterclockwise 90 -> transpose=2
+        transpose_filter = "transpose=1" if rot == 90 else "transpose=2"
+    elif rot == 180:
+        transpose_filter = "hflip,vflip"
 
     # Transcribe added audio
     try:
         segments, _ = MODEL.transcribe(apath, vad_filter=True, word_timestamps=True)
-
         all_words = []
         for seg in segments:
             if getattr(seg, "words", None):
@@ -268,6 +313,7 @@ def render():
     except Exception as e:
         return {"error": "Transcription failed", "details": str(e)}, 500
 
+    # unique emoji inputs
     unique_emojis = []
     for _, _, f, _ in emoji_events:
         if f not in unique_emojis:
@@ -279,44 +325,38 @@ def render():
 
     force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
+    # stable zoompan (on displayed size)
     total_frames = max(2, int(out_dur * ZOOM_FPS))
     z_delta = (ZOOM_END - ZOOM_START)
-
     zoom_expr = f"{ZOOM_START}+({z_delta})*on/{total_frames}"
     x_expr = "iw/2-(iw/zoom/2)"
     y_expr = "ih/2-(ih/zoom/2)"
 
     filter_steps = []
 
-    if size_ok:
-        # ✅ Keep EXACT same orientation/size as input
-        filter_steps.append(
-            f"[0:v]fps={ZOOM_FPS},"
-            f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d=1:s={vw}x{vh},"
-            f"setpts=PTS-STARTPTS,"
-            f"subtitles={srt_path}:force_style='{force_style}'[v0]"
-        )
-    else:
-        # fallback: no zoompan forced size -> keep original with scale+crop centered
-        # (still preserves orientation, no forced horizontal)
-        # Micro zoom via scale then crop back to original
-        dur_s = max(0.001, float(out_dur))
-        zoom_t = f"({ZOOM_START}+({ZOOM_END - ZOOM_START})*t/{dur_s:.6f})"
-        filter_steps.append(
-            f"[0:v]"
-            f"scale=iw*{zoom_t}:ih*{zoom_t},"
-            f"crop=iw:ih:(in_w-out_w)/2:(in_h-out_h)/2,"
-            f"subtitles={srt_path}:force_style='{force_style}'[v0]"
-        )
+    # ✅ Apply transpose first (fix orientation), then zoompan -> subtitles
+    pre = "[0:v]"
+    chain = []
 
+    if transpose_filter:
+        chain.append(transpose_filter)
+
+    chain.append(f"fps={ZOOM_FPS}")
+    chain.append(f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d=1:s={disp_w}x{disp_h}")
+    chain.append("setpts=PTS-STARTPTS")
+    chain.append(f"subtitles={srt_path}:force_style='{force_style}'")
+
+    filter_steps.append(f"{pre}{','.join(chain)}[v0]")
     current = "v0"
 
+    # emojis centered
     x_center = "(W-w)/2"
     y_center = "(H-h)/2"
 
     for idx_ev, (s, e, fname, _shown_text) in enumerate(emoji_events):
         inp_index = 2 + unique_emojis.index(fname)
         next_v = f"v{idx_ev+1}"
+
         filter_steps.append(f"[{inp_index}:v]scale={EMOJI_SIZE}:-1[em{idx_ev}]")
         filter_steps.append(
             f"[{current}][em{idx_ev}]overlay="
@@ -325,6 +365,7 @@ def render():
         )
         current = next_v
 
+    # audio mix
     if video_has_audio(vpath):
         filter_steps.append(f"[0:a]volume={VIDEO_VOL},aresample=async=1:first_pts=0[a0]")
         filter_steps.append(f"[1:a]volume={ADDED_AUDIO_VOL},aresample=async=1:first_pts=0[a1]")
@@ -348,6 +389,8 @@ def render():
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
+        # ✅ remove rotate metadata so players don't flip it again
+        "-metadata:s:v:0", "rotate=0",
         out
     ]
 
@@ -356,6 +399,7 @@ def render():
         return {"error": "ffmpeg failed", "stderr": (p.stderr or "")[-4000:]}, 500
 
     return send_file(out, mimetype="video/mp4")
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
