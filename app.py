@@ -25,10 +25,10 @@ EMOJI_MAX_DUR = 0.5
 VIDEO_VOL = 1.0
 ADDED_AUDIO_VOL = 1.0
 
-# MICRO progressive zoom (whole video)
+# ✅ MICRO progressive zoom
 ZOOM_START = 1.00
-ZOOM_END = 1.03   # or 1.025
-ZOOM_FPS = 30
+ZOOM_END = 1.03   # ✅ 1.025 for 102.5%
+ZOOM_FPS = 30      # stable
 
 MODEL = WhisperModel(
     WHISPER_MODEL_NAME,
@@ -97,7 +97,7 @@ def get_duration_seconds(path: str) -> float:
 def get_video_stream_info(path: str):
     """
     Returns dict: width, height, rot(0/90/180/270)
-    IMPORTANT: reads metadata rotation.
+    Reads rotation metadata.
     """
     p = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -168,6 +168,7 @@ def pick_emoji_for_text(text: str):
     return None
 
 def make_emoji_events_from_captions(captions):
+    # Only ONE occurrence per emoji type for whole video
     events = []
     used_types = set()
     for (s, e, text) in captions:
@@ -279,16 +280,14 @@ def render():
     except Exception as e:
         return {"error": "Cannot read video info", "details": str(e)}, 500
 
-    # ✅ FIX: inverted orientation -> swap transpose mapping
+    # ✅ Correct rotation (mapping fixed)
     transpose_filter = None
     disp_w, disp_h = vw, vh
 
     if rot == 90:
-        # (was transpose=1) -> invert to transpose=2
         transpose_filter = "transpose=2"
         disp_w, disp_h = vh, vw
     elif rot == 270:
-        # (was transpose=2) -> invert to transpose=1
         transpose_filter = "transpose=1"
         disp_w, disp_h = vh, vw
     elif rot == 180:
@@ -329,6 +328,7 @@ def render():
 
     force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
+    # ✅ MICRO zoompan over whole duration
     total_frames = max(2, int(out_dur * ZOOM_FPS))
     z_delta = (ZOOM_END - ZOOM_START)
     zoom_expr = f"{ZOOM_START}+({z_delta})*on/{total_frames}"
