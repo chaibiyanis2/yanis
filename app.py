@@ -96,8 +96,8 @@ def get_duration_seconds(path: str) -> float:
 
 def get_video_stream_info(path: str):
     """
-    Returns dict with width, height, rotation_degrees (0/90/180/270 if found).
-    Robust: json output.
+    Returns dict: width, height, rot(0/90/180/270)
+    IMPORTANT: This reads *metadata* rotation, not auto-rotated pixels.
     """
     p = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -125,16 +125,17 @@ def get_video_stream_info(path: str):
         except Exception:
             rot = 0
 
-    # Some ffprobe builds store rotation in side_data_list
     sdl = st.get("side_data_list") or []
     for sd in sdl:
-        # rotation might appear as "rotation": -90.0 or similar
         if "rotation" in sd:
             try:
-                rr = int(round(float(sd["rotation"]))) % 360
-                rot = rr
+                rot = int(round(float(sd["rotation"]))) % 360
             except Exception:
                 pass
+
+    # Normalize to {0,90,180,270}
+    if rot not in (0, 90, 180, 270):
+        rot = 0
 
     return {"w": w, "h": h, "rot": rot}
 
@@ -271,7 +272,7 @@ def render():
     except Exception as e:
         return {"error": "Cannot read mp3 duration", "details": str(e)}, 500
 
-    # ✅ Read real video width/height + rotation metadata
+    # Read real width/height + rotation metadata
     try:
         info = get_video_stream_info(vpath)
         vw, vh, rot = info["w"], info["h"], info["rot"]
@@ -280,21 +281,26 @@ def render():
     except Exception as e:
         return {"error": "Cannot read video info", "details": str(e)}, 500
 
-    # If rotation is 90/270, displayed orientation is swapped
-    disp_w, disp_h = vw, vh
+    # Decide ONE correction rotation (because we will disable auto-rotate in ffmpeg)
     transpose_filter = None
+    disp_w, disp_h = vw, vh
 
-    if rot in (90, 270, -90):
-        disp_w, disp_h = vh, vw  # swap for displayed
-        # rot=90 means clockwise 90 -> transpose=1
-        # rot=270 means counterclockwise 90 -> transpose=2
-        transpose_filter = "transpose=1" if rot == 90 else "transpose=2"
+    if rot == 90:
+        # metadata says: rotate clockwise 90 to display => bake same into pixels
+        transpose_filter = "transpose=1"
+        disp_w, disp_h = vh, vw
+    elif rot == 270:
+        # rotate counterclockwise 90 to display
+        transpose_filter = "transpose=2"
+        disp_w, disp_h = vh, vw
     elif rot == 180:
         transpose_filter = "hflip,vflip"
+        disp_w, disp_h = vw, vh
 
     # Transcribe added audio
     try:
         segments, _ = MODEL.transcribe(apath, vad_filter=True, word_timestamps=True)
+
         all_words = []
         for seg in segments:
             if getattr(seg, "words", None):
@@ -319,13 +325,14 @@ def render():
         if f not in unique_emojis:
             unique_emojis.append(f)
 
-    ffmpeg_cmd = ["ffmpeg", "-y", "-i", vpath, "-i", apath]
+    # ✅ IMPORTANT: disable auto-rotation for video input
+    ffmpeg_cmd = ["ffmpeg", "-y", "-noautorotate", "-i", vpath, "-i", apath]
     for f in unique_emojis:
         ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
 
     force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
-    # stable zoompan (on displayed size)
+    # stable zoompan (on final displayed size)
     total_frames = max(2, int(out_dur * ZOOM_FPS))
     z_delta = (ZOOM_END - ZOOM_START)
     zoom_expr = f"{ZOOM_START}+({z_delta})*on/{total_frames}"
@@ -334,19 +341,18 @@ def render():
 
     filter_steps = []
 
-    # ✅ Apply transpose first (fix orientation), then zoompan -> subtitles
-    pre = "[0:v]"
     chain = []
-
     if transpose_filter:
         chain.append(transpose_filter)
 
-    chain.append(f"fps={ZOOM_FPS}")
-    chain.append(f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d=1:s={disp_w}x{disp_h}")
-    chain.append("setpts=PTS-STARTPTS")
-    chain.append(f"subtitles={srt_path}:force_style='{force_style}'")
+    chain += [
+        f"fps={ZOOM_FPS}",
+        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d=1:s={disp_w}x{disp_h}",
+        "setpts=PTS-STARTPTS",
+        f"subtitles={srt_path}:force_style='{force_style}'",
+    ]
 
-    filter_steps.append(f"{pre}{','.join(chain)}[v0]")
+    filter_steps.append(f"[0:v]{','.join(chain)}[v0]")
     current = "v0"
 
     # emojis centered
@@ -356,7 +362,6 @@ def render():
     for idx_ev, (s, e, fname, _shown_text) in enumerate(emoji_events):
         inp_index = 2 + unique_emojis.index(fname)
         next_v = f"v{idx_ev+1}"
-
         filter_steps.append(f"[{inp_index}:v]scale={EMOJI_SIZE}:-1[em{idx_ev}]")
         filter_steps.append(
             f"[{current}][em{idx_ev}]overlay="
@@ -389,7 +394,7 @@ def render():
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
-        # ✅ remove rotate metadata so players don't flip it again
+        # ✅ avoid any extra rotation by players
         "-metadata:s:v:0", "rotate=0",
         out
     ]
