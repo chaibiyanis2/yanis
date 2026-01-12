@@ -97,7 +97,7 @@ def get_duration_seconds(path: str) -> float:
 def get_video_stream_info(path: str):
     """
     Returns dict: width, height, rot(0/90/180/270)
-    IMPORTANT: This reads *metadata* rotation, not auto-rotated pixels.
+    IMPORTANT: reads metadata rotation.
     """
     p = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -133,7 +133,6 @@ def get_video_stream_info(path: str):
             except Exception:
                 pass
 
-    # Normalize to {0,90,180,270}
     if rot not in (0, 90, 180, 270):
         rot = 0
 
@@ -169,7 +168,6 @@ def pick_emoji_for_text(text: str):
     return None
 
 def make_emoji_events_from_captions(captions):
-    # Only ONE occurrence per emoji type for whole video
     events = []
     used_types = set()
     for (s, e, text) in captions:
@@ -272,7 +270,7 @@ def render():
     except Exception as e:
         return {"error": "Cannot read mp3 duration", "details": str(e)}, 500
 
-    # Read real width/height + rotation metadata
+    # Read width/height + rotation metadata
     try:
         info = get_video_stream_info(vpath)
         vw, vh, rot = info["w"], info["h"], info["rot"]
@@ -281,17 +279,17 @@ def render():
     except Exception as e:
         return {"error": "Cannot read video info", "details": str(e)}, 500
 
-    # Decide ONE correction rotation (because we will disable auto-rotate in ffmpeg)
+    # ✅ FIX: inverted orientation -> swap transpose mapping
     transpose_filter = None
     disp_w, disp_h = vw, vh
 
     if rot == 90:
-        # metadata says: rotate clockwise 90 to display => bake same into pixels
-        transpose_filter = "transpose=1"
+        # (was transpose=1) -> invert to transpose=2
+        transpose_filter = "transpose=2"
         disp_w, disp_h = vh, vw
     elif rot == 270:
-        # rotate counterclockwise 90 to display
-        transpose_filter = "transpose=2"
+        # (was transpose=2) -> invert to transpose=1
+        transpose_filter = "transpose=1"
         disp_w, disp_h = vh, vw
     elif rot == 180:
         transpose_filter = "hflip,vflip"
@@ -319,20 +317,18 @@ def render():
     except Exception as e:
         return {"error": "Transcription failed", "details": str(e)}, 500
 
-    # unique emoji inputs
     unique_emojis = []
     for _, _, f, _ in emoji_events:
         if f not in unique_emojis:
             unique_emojis.append(f)
 
-    # ✅ IMPORTANT: disable auto-rotation for video input
+    # ✅ disable auto-rotation for video input
     ffmpeg_cmd = ["ffmpeg", "-y", "-noautorotate", "-i", vpath, "-i", apath]
     for f in unique_emojis:
         ffmpeg_cmd += ["-i", f"/app/emojis/{f}"]
 
     force_style = f"FontName=DejaVu Sans,FontSize={FONT_SIZE},Outline=2,Shadow=1,MarginV={MARGIN_V}"
 
-    # stable zoompan (on final displayed size)
     total_frames = max(2, int(out_dur * ZOOM_FPS))
     z_delta = (ZOOM_END - ZOOM_START)
     zoom_expr = f"{ZOOM_START}+({z_delta})*on/{total_frames}"
@@ -394,7 +390,6 @@ def render():
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
-        # ✅ avoid any extra rotation by players
         "-metadata:s:v:0", "rotate=0",
         out
     ]
